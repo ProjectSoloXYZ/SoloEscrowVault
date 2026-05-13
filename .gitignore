@@ -1,0 +1,22 @@
+# Foundry
+out/
+cache/
+lib/
+
+# Python
+__pycache__/
+*.pyc
+.env
+.venv/
+
+# Deploy artifacts
+deployed_contracts.json
+broadcast/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
