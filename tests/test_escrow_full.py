@@ -148,7 +148,15 @@ def send_tx(func, from_name: str):
         'gasPrice': w3.eth.gas_price,
     })
     signed = w3.eth.account.sign_transaction(tx, key)
-    return w3.eth.wait_for_transaction_receipt(w3.eth.send_raw_transaction(signed.raw_transaction)); assert receipt["status"] == 1, "Tx reverted"
+    receipt = w3.eth.wait_for_transaction_receipt(w3.eth.send_raw_transaction(signed.raw_transaction))
+    assert receipt["status"] == 1, "Tx reverted"
+    return receipt
+
+def platform_fee_for_budget(escrow, budget: int) -> int:
+    """按当前全局平台费率估算新任务会锁定的平台费。"""
+    fee_bps = escrow.functions.platformFeeBps().call()
+    denominator = escrow.functions.FEE_DENOMINATOR_BPS().call()
+    return budget * fee_bps // denominator
 
 # ==========================================
 # 5. 部署合约
@@ -281,12 +289,14 @@ def run_phase1_test(token_addr: str, escrow_addr: str):
         current_time = w3.eth.get_block('latest')['timestamp']
         qualify_deadline = current_time + 3600
         settlement_deadline = current_time + 7200
+        platform_fee = platform_fee_for_budget(escrow, budget)
+        max_reward_pool = budget - platform_fee
 
         send_tx(escrow.functions.createTask(
             task_id,
             token_addr,
             budget,
-            budget,     # basePool 等于 budget
+            max_reward_pool,  # basePool 给平台费留出空间
             0,          # lottery_reward_per_winner
             0,          # lottery_winner_count
             qualify_deadline,
@@ -333,9 +343,9 @@ def run_phase1_test(token_addr: str, escrow_addr: str):
         task_info = escrow.functions.tasks(task_id).call()
         print(f"   任务状态: {task_info[10]} (2=QUALIFIED)")
 
-        # ▶ 调用 settleTask(): 0人合格，按照正确逻辑发奖必须为0，全部预算算作 refund
+        # ▶ 调用 settleTask(): 0人合格，正常结算仍按任务总预算计提平台费
         payout = 0
-        refund = budget
+        refund = budget - platform_fee
         send_tx(escrow.functions.settleTask(
             task_id, 
             server_secret,      # seedReveal —— 揭示之前承诺的随机种子
@@ -347,7 +357,7 @@ def run_phase1_test(token_addr: str, escrow_addr: str):
             0,                  # baseRewardPerQualified —— 每人基础奖励
             0                   # actualWinnerCount —— 实际中奖人数
         ), 'operator')
-        print(f"   [OK] 任务结算完成！支付: {payout}，退款: {refund}")
+        print(f"   [OK] 任务结算完成！支付: {payout}，退款: {refund}，平台费: {platform_fee}")
         final_task = escrow.functions.tasks(task_id).call()
         print(f"   最终状态: {final_task[10]} (4=REFUNDABLE 且无退款为 3=SETTLED)")
     else:
@@ -393,7 +403,7 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
     task_id_a       = w3.keccak(text=f"task_p2a_{int(time.time())}")
     
     task_budget_a   = 100 * (10 ** 18)  
-    base_pool_a     = 80 * (10 ** 18)
+    base_pool_a     = 78 * (10 ** 18)
     lottery_r_a     = 10 * (10 ** 18)
     current_time = w3.eth.get_block('latest')['timestamp']
     
@@ -427,7 +437,8 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
     user1_reward_a = base_reward_per_a + (lottery_r_a if user1_addr in winners_a else 0)
     user2_reward_a = base_reward_per_a + (lottery_r_a if user2_addr in winners_a else 0)
     payout_amount_a = user1_reward_a + user2_reward_a
-    refund_amount_a = task_budget_a - payout_amount_a
+    platform_fee_a = platform_fee_for_budget(escrow, task_budget_a)
+    refund_amount_a = task_budget_a - payout_amount_a - platform_fee_a
 
     # 快进并冻结
     w3.provider.make_request('evm_increaseTime', [3601])
@@ -445,7 +456,7 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
         task_id_a, server_secret_a, 0, bytes(32), bytes("result", "utf-8").rjust(32, b'\0'),
         payout_amount_a, refund_amount_a, base_reward_per_a, 1
     ), 'operator')
-    print(f"   [OK]任务 A 已结算! 发放: {payout_amount_a / (10**18)}, 退款: {refund_amount_a / (10**18)}")
+    print(f"   [OK]任务 A 已结算! 发放: {payout_amount_a / (10**18)}, 退款: {refund_amount_a / (10**18)}, 平台费: {platform_fee_a / (10**18)}")
     send_tx(escrow.functions.claimRefund(task_id_a, sponsor_addr), 'sponsor')
     # ================= 任务 A 结束 =================
 
@@ -457,7 +468,7 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
     task_id_b       = w3.keccak(text=f"task_p2b_{int(time.time())}")
     
     task_budget_b   = 120 * (10 ** 18)  
-    base_pool_b     = 100 * (10 ** 18)
+    base_pool_b     = 96 * (10 ** 18)
     lottery_r_b     = 10 * (10 ** 18)
     current_time = w3.eth.get_block('latest')['timestamp']
     
@@ -489,7 +500,8 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
     user1_reward_b = base_reward_per_b + (lottery_r_b if user1_addr in winners_b else 0)
     user2_reward_b = base_reward_per_b + (lottery_r_b if user2_addr in winners_b else 0)
     payout_amount_b = user1_reward_b + user2_reward_b
-    refund_amount_b = task_budget_b - payout_amount_b
+    platform_fee_b = platform_fee_for_budget(escrow, task_budget_b)
+    refund_amount_b = task_budget_b - payout_amount_b - platform_fee_b
 
     # 快进并冻结
     w3.provider.make_request('evm_increaseTime', [3601])
@@ -507,15 +519,15 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
         task_id_b, server_secret_b, 0, bytes(32), bytes("result", "utf-8").rjust(32, b'\0'),
         payout_amount_b, refund_amount_b, base_reward_per_b, 1
     ), 'operator')
-    print(f"   [OK]任务 B 已结算! 发放: {payout_amount_b / (10**18)}, 退款: {refund_amount_b / (10**18)}")
+    print(f"   [OK]任务 B 已结算! 发放: {payout_amount_b / (10**18)}, 退款: {refund_amount_b / (10**18)}, 平台费: {platform_fee_b / (10**18)}")
     send_tx(escrow.functions.claimRefund(task_id_b, sponsor_addr), 'sponsor')
     # ================= 任务 B 结束 =================
 
 
     # ================= 汇总发布与提现 =================
     # 两任务累加（并加上过往已经提取的历史金额，保证 cumulativeAmount 是终身发奖总额）
-    user1_past_claimed = escrow.functions.claimed(token_addr, user1_addr).call()
-    user2_past_claimed = escrow.functions.claimed(token_addr, user2_addr).call()
+    user1_past_claimed = escrow.functions.claimed(user1_addr, token_addr).call()
+    user2_past_claimed = escrow.functions.claimed(user2_addr, token_addr).call()
 
     user1_cumulative = user1_past_claimed + user1_reward_a + user1_reward_b
     user2_cumulative = user2_past_claimed + user2_reward_a + user2_reward_b
@@ -607,6 +619,15 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
     except Exception as e:
         print(f"   [FAIL] User2 提现失败: {e}")
 
+    # 步骤 8: 平台提现本周期已计提的平台费
+    print("\n[步骤 8] 管理员提现平台费...")
+    fee_balance = escrow.functions.platformFeeBalances(token_addr).call()
+    treasury_addr = escrow.functions.platformTreasury().call()
+    treasury_before = token.functions.balanceOf(treasury_addr).call()
+    send_tx(escrow.functions.withdrawPlatformFees(token_addr, treasury_addr, fee_balance), 'operator')
+    treasury_after = token.functions.balanceOf(treasury_addr).call()
+    print(f"   [OK] 平台费提现成功: {(treasury_after - treasury_before) / (10**18)} Token")
+
     print("\n" + "="*60)
     print("[SUCCESS] 第二阶段测试全部通过! (多任务合并提取演示完成)")
     print("="*60)
@@ -643,8 +664,9 @@ def run_phase3_test(token_addr: str, escrow_addr: str):
 
     send_tx(token.functions.approve(escrow_addr, budget), 'sponsor')
     current_time = w3.eth.get_block('latest')['timestamp']
+    max_reward_pool = budget - platform_fee_for_budget(escrow, budget)
     send_tx(escrow.functions.createTask(
-        task_id, token_addr, budget, budget, 0, 0,
+        task_id, token_addr, budget, max_reward_pool, 0, 0,
         current_time + 100, current_time + 200, seed_commit
     ), 'sponsor')
     print("   [OK] 任务已创建，等待结算超时...")
@@ -671,7 +693,7 @@ def run_phase3_test(token_addr: str, escrow_addr: str):
     
     current_time = w3.eth.get_block('latest')['timestamp']
     send_tx(escrow.functions.createTask(
-        task_id2, token_addr, budget, budget, 0, 0,
+        task_id2, token_addr, budget, 1, 0, 0,
         current_time + 100, current_time + 200, seed_commit
     ), 'sponsor')
     
@@ -683,12 +705,13 @@ def run_phase3_test(token_addr: str, escrow_addr: str):
     q_root = w3.keccak(q_leaf + bytes(32))  # 单叶子简化为 root
     send_tx(escrow.functions.finalizeQualification(task_id2, 1, q_root, fake_manifest), 'operator')
 
-    # payout=1 wei, refund=budget-1，确保 settledButUnallocated > 0
+    # payout=1 wei，refund 扣除平台费后返还 Sponsor，确保 settledButUnallocated > 0
+    platform_fee = platform_fee_for_budget(escrow, budget)
     send_tx(escrow.functions.settleTask(
         task_id2, server_secret, 0, bytes(32), fake_manifest,
-        1, budget - 1, 1, 0
+        1, budget - platform_fee - 1, 1, 0
     ), 'operator')
-    print("   [OK] 第二个任务结算完成，Operator 获得可用池度")
+    print(f"   [OK] 第二个任务结算完成，Operator 获得可用池度，平台费: {platform_fee / (10**18)} Token")
 
     # 2. Operator 发布有问题的 Root
     #    ▶ 调用 publishPendingRoot() 发布一个恶意的 Merkle Root
@@ -740,8 +763,9 @@ def run_phase4_upgrade_test(token_addr: str, escrow_addr: str):
 
     current_time = w3.eth.get_block('latest')['timestamp']
     send_tx(token.functions.approve(escrow_addr, budget), 'sponsor')
+    max_reward_pool = budget - platform_fee_for_budget(escrow, budget)
     receipt = send_tx(escrow.functions.createTask(
-        task_id, token_addr, budget, budget, 0, 0,
+        task_id, token_addr, budget, max_reward_pool, 0, 0,
         current_time + 3600, current_time + 7200, seed_commit
     ), 'sponsor')
     assert receipt.status == 1, "升级前任务创建失败"
@@ -808,8 +832,9 @@ def run_phase4_upgrade_test(token_addr: str, escrow_addr: str):
 
     current_time = w3.eth.get_block('latest')['timestamp']
     send_tx(token.functions.approve(escrow_addr, budget), 'sponsor')
+    max_reward_pool = budget - platform_fee_for_budget(escrow, budget)
     receipt = send_tx(escrow.functions.createTask(
-        task_id2, token_addr, budget, budget, 0, 0,
+        task_id2, token_addr, budget, max_reward_pool, 0, 0,
         current_time + 3600, current_time + 7200, seed_commit2
     ), 'sponsor')
     assert receipt.status == 1, "升级后新任务创建失败"
@@ -823,7 +848,7 @@ def run_phase4_upgrade_test(token_addr: str, escrow_addr: str):
     assert receipt.status == 1, "升级后 finalizeQualification 失败"
     receipt = send_tx(escrow.functions.settleTask(
         task_id2, server_secret2, 0, bytes(32), fake_manifest,
-        0, budget, 0, 0
+        0, budget - platform_fee_for_budget(escrow, budget), 0, 0
     ), 'operator')
     assert receipt.status == 1, "升级后 settleTask 失败"
     print("   [OK] 升级后任务结算流程正常")
