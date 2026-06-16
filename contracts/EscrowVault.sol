@@ -36,6 +36,15 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
     // 守护者角色：负责暂停系统、取消错误 root
     bytes32 public constant GUARDIAN_ROLE = keccak256("GUARDIAN_ROLE");
 
+    // 费率分母，10000 = 100%
+    uint16 public constant FEE_DENOMINATOR_BPS = 10_000;
+
+    // 平台费率上限，1000 = 10%
+    uint16 public constant MAX_PLATFORM_FEE_BPS = 1_000;
+
+    // 默认平台费率，200 = 2%
+    uint16 public constant DEFAULT_PLATFORM_FEE_BPS = 200;
+
     /**
      * @dev 任务状态机
      * NONE       : 不存在
@@ -69,6 +78,7 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
      * settlementDeadline      结算截止时间
      * seedCommit              对随机种子的承诺值（commit）seedCommit：前面先提交的哈希承诺
      * status                  当前任务状态
+     * platformFeeBps          创建任务时锁定的平台费率
      */
     struct TaskConfig {
         bytes32 taskId;
@@ -82,6 +92,7 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         uint64 settlementDeadline;
         bytes32 seedCommit;
         TaskStatus status;
+        uint16 platformFeeBps;
     }
 
     /**
@@ -108,6 +119,7 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
      * actualWinnerCount       实际中奖人数
      * payoutAmount            本任务实际用于发奖的金额
      * refundableAmount        Sponsor 可退回金额
+     * platformFeeAmount       平台服务费金额
      * settledAt               结算时间
      */
     struct Settlement {
@@ -120,6 +132,7 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         uint96 payoutAmount;
         uint96 refundableAmount;
         uint64 settledAt;
+        uint96 platformFeeAmount;
     }
 
     /**
@@ -181,8 +194,17 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
     // token 白名单，只有白名单 token 才能用于任务
     mapping(address => bool) public tokenWhitelist;
 
+    // 当前全局平台费率，单位 bps；创建任务时会锁定到 TaskConfig
+    uint16 public platformFeeBps;
+
+    // 平台费默认接收地址，由管理员维护
+    address public platformTreasury;
+
+    // token => 已计提但尚未提现的平台费
+    mapping(address => uint256) public platformFeeBalances;
+
     // 给未来升级预留存储槽，避免存储冲突
-    uint256[41] private __gap;
+    uint256[39] private __gap;
 
     // =========================
     //         事件
@@ -211,7 +233,8 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         uint16 lotteryWinnerCount,
         uint64 qualifyDeadline,
         uint64 settlementDeadline,
-        bytes32 seedCommit
+        bytes32 seedCommit,
+        uint16 platformFeeBps
     );
 
     /**
@@ -247,6 +270,7 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
      * @param refundableAmount        可退还给 Sponsor 的剩余金额
      * @param baseRewardPerQualified  每个合格用户可得的基础奖励
      * @param actualWinnerCount       本次结算实际选出的中奖者人数
+     * @param platformFeeAmount       本次计提的平台服务费
      */
     event TaskSettled(
         bytes32 indexed taskId,
@@ -257,7 +281,8 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         uint96 payoutAmount,
         uint96 refundableAmount,
         uint96 baseRewardPerQualified,
-        uint16 actualWinnerCount
+        uint16 actualWinnerCount,
+        uint96 platformFeeAmount
     );
 
     /**
@@ -349,6 +374,26 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
      */
     event GuardianUpdated(address indexed oldGuardian, address indexed newGuardian);
 
+    /**
+     * @dev 平台费率更新事件
+     */
+    event PlatformFeeBpsUpdated(uint16 oldBps, uint16 newBps);
+
+    /**
+     * @dev 平台费接收地址更新事件
+     */
+    event PlatformTreasuryUpdated(address indexed oldTreasury, address indexed newTreasury);
+
+    /**
+     * @dev 平台费计提事件
+     */
+    event PlatformFeeAccrued(bytes32 indexed taskId, address indexed token, uint256 amount, uint16 feeBps);
+
+    /**
+     * @dev 平台费提现事件
+     */
+    event PlatformFeeWithdrawn(address indexed token, address indexed recipient, uint256 amount);
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         // 禁用实现合约的初始化，防止实现合约被人单独初始化劫持
@@ -374,6 +419,23 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         _grantRole(DEFAULT_ADMIN_ROLE, initialAdmin);
         _grantRole(OPERATOR_ROLE, initialOperator);
         _grantRole(GUARDIAN_ROLE, initialGuardian);
+
+        platformFeeBps = DEFAULT_PLATFORM_FEE_BPS;
+        platformTreasury = initialAdmin;
+        emit PlatformFeeBpsUpdated(0, DEFAULT_PLATFORM_FEE_BPS);
+        emit PlatformTreasuryUpdated(address(0), initialAdmin);
+    }
+
+    /**
+     * @dev V2 初始化：供旧代理升级后设置平台费默认参数。
+     */
+    function initializeV2(address initialTreasury) external onlyRole(DEFAULT_ADMIN_ROLE) reinitializer(2) {
+        require(initialTreasury != address(0), "bad treasury");
+
+        platformFeeBps = DEFAULT_PLATFORM_FEE_BPS;
+        platformTreasury = initialTreasury;
+        emit PlatformFeeBpsUpdated(0, DEFAULT_PLATFORM_FEE_BPS);
+        emit PlatformTreasuryUpdated(address(0), initialTreasury);
     }
 
     /**
@@ -417,6 +479,44 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         _revokeRole(GUARDIAN_ROLE, oldGuardian);
         _grantRole(GUARDIAN_ROLE, newGuardian);
         emit GuardianUpdated(oldGuardian, newGuardian);
+    }
+
+    /**
+     * @dev 管理员更新平台费率，单位 bps。
+     */
+    function setPlatformFeeBps(uint16 newBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newBps <= MAX_PLATFORM_FEE_BPS, "fee too high");
+        uint16 oldBps = platformFeeBps;
+        platformFeeBps = newBps;
+        emit PlatformFeeBpsUpdated(oldBps, newBps);
+    }
+
+    /**
+     * @dev 管理员更新平台费默认接收地址。
+     */
+    function setPlatformTreasury(address newTreasury) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newTreasury != address(0), "bad treasury");
+        address oldTreasury = platformTreasury;
+        platformTreasury = newTreasury;
+        emit PlatformTreasuryUpdated(oldTreasury, newTreasury);
+    }
+
+    /**
+     * @dev 管理员提现已计提的平台费。
+     */
+    function withdrawPlatformFees(address token, address recipient, uint256 amount)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        nonReentrant
+    {
+        require(recipient != address(0), "bad recipient");
+        require(amount > 0, "zero amount");
+        require(amount <= platformFeeBalances[token], "insufficient fee balance");
+
+        platformFeeBalances[token] -= amount;
+        IERC20(token).safeTransfer(recipient, amount);
+
+        emit PlatformFeeWithdrawn(token, recipient, amount);
     }
 
     /**
@@ -475,12 +575,18 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         // 结算截止必须不早于资格截止
         require(settlementDeadline >= qualifyDeadline, "Bad settlementDeadline");
 
-        // 保底分配 + 抽奖分配 不能超过总预算
+        // 保底分配 + 抽奖分配 + 平台费不能超过总预算。
+        // 平台费从 totalBudget 中计提，因此创建时必须确保最大承诺奖励仍可支付。
         uint256 reserved = uint256(basePool) + uint256(lotteryRewardPerWinner) * uint256(lotteryWinnerCount);
-        require(reserved <= totalBudget, "Budget params invalid");
+        uint256 estimatedPlatformFee = _calculatePlatformFee(totalBudget, platformFeeBps);
+        require(reserved + estimatedPlatformFee <= totalBudget, "Budget params invalid");
 
-        // Sponsor 把总预算转进合约
+        // Sponsor 把总预算转进合约，并强制实收金额等于 totalBudget。
+        // EscrowVault 使用内部账本分配资金，不支持转账税、通缩或 rebasing token。
+        uint256 beforeBalance = IERC20(token).balanceOf(address(this));
         IERC20(token).safeTransferFrom(msg.sender, address(this), totalBudget);
+        uint256 received = IERC20(token).balanceOf(address(this)) - beforeBalance;
+        require(received == totalBudget, "Bad token transfer");
 
         // 保存任务信息
         tasks[taskId] = TaskConfig({
@@ -494,7 +600,8 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
             qualifyDeadline: qualifyDeadline,
             settlementDeadline: settlementDeadline,
             seedCommit: seedCommit,
-            status: TaskStatus.FUNDED
+            status: TaskStatus.FUNDED,
+            platformFeeBps: platformFeeBps
         });
 
         emit TaskCreated(
@@ -507,7 +614,8 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
             lotteryWinnerCount,
             qualifyDeadline,
             settlementDeadline,
-            seedCommit
+            seedCommit,
+            platformFeeBps
         );
     }
 
@@ -607,8 +715,13 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         // reveal 必须和创建任务时的 seedCommit 对上
         require(keccak256(abi.encodePacked(seedReveal)) == t.seedCommit, "seedReveal mismatch");
 
-        // 发奖金额 + 退款金额 = 总预算
-        require(uint256(payoutAmount) + uint256(refundableAmount) == t.totalBudget, "Sum mismatch");
+        uint96 platformFeeAmount = _calculatePlatformFee(t.totalBudget, t.platformFeeBps);
+
+        // 发奖金额 + 退款金额 + 平台费 = 总预算
+        require(
+            uint256(payoutAmount) + uint256(refundableAmount) + uint256(platformFeeAmount) == t.totalBudget,
+            "Sum mismatch"
+        );
 
         // 实际中奖人数不能超过计划中奖人数
         require(actualWinnerCount <= t.lotteryWinnerCount, "Too many winners");
@@ -631,6 +744,10 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
             require(actualWinnerCount <= q.qualifiedCount, "winnerCount exceeds qualified");
         }
 
+        uint256 expectedPayout = uint256(baseRewardPerQualified) * uint256(q.qualifiedCount)
+            + uint256(t.lotteryRewardPerWinner) * uint256(actualWinnerCount);
+        require(uint256(payoutAmount) == expectedPayout, "Payout mismatch");
+
         settlements[taskId] = Settlement({
             seedReveal: seedReveal,
             entropyRef: entropyRef,
@@ -640,11 +757,18 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
             actualWinnerCount: actualWinnerCount,
             payoutAmount: payoutAmount,
             refundableAmount: refundableAmount,
-            settledAt: uint64(block.timestamp)
+            settledAt: uint64(block.timestamp),
+            platformFeeAmount: platformFeeAmount
         });
 
         // 把这次结算中应发给用户的金额，放进“已结算但还没分配到 root”的池子
         settledButUnallocated[t.token] += payoutAmount;
+
+        // 只有成功结算才计提平台费；取消和超时强退不收费。
+        if (platformFeeAmount > 0) {
+            platformFeeBalances[t.token] += platformFeeAmount;
+            emit PlatformFeeAccrued(taskId, t.token, platformFeeAmount, t.platformFeeBps);
+        }
 
         // 有退款则进入 REFUNDABLE，否则直接 SETTLED
         t.status = refundableAmount > 0 ? TaskStatus.REFUNDABLE : TaskStatus.SETTLED;
@@ -658,7 +782,8 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
             payoutAmount,
             refundableAmount,
             baseRewardPerQualified,
-            actualWinnerCount
+            actualWinnerCount,
+            platformFeeAmount
         );
     }
 
@@ -876,5 +1001,9 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         }
 
         return cumulativeAmount - alreadyClaimed;
+    }
+
+    function _calculatePlatformFee(uint96 totalBudget, uint16 feeBps) internal pure returns (uint96) {
+        return uint96((uint256(totalBudget) * uint256(feeBps)) / FEE_DENOMINATOR_BPS);
     }
 }
