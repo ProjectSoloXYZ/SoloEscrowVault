@@ -175,7 +175,22 @@ python tests/test_escrow_full.py
 4. **第三阶段**：`emergencyRefund` 超时退款 + Guardian `cancelPendingRoot`。
 5. **第四阶段**：UUPS `upgradeToAndCall` 升级及权限校验。
 
-### 6. 重新跑测试（可选）
+### 6. 运行 CertiK 审计修复专项验证测试
+
+针对 SOL-04/05/07/08/10 五项代码修改的专项验证：
+
+```bash
+python tests/test_audit_fixes.py
+```
+
+脚本会自动验证：
+- **SOL-04**：`claim()` 超额领取被链上拦截（Exceeds total allocated）
+- **SOL-05**：`delayWindow < 3600` 被 revert（Delay too short）
+- **SOL-07**：`transfer/transferFrom` 到零地址被 revert
+- **SOL-08**：角色轮换传错旧地址被 revert（oldOperator lacks role）
+- **SOL-10**：代币下架后 `emergencyReleaseDelistedFunds()` 正常释放资金
+
+### 7. 重新跑测试（可选）
 
 如需从干净状态再跑一次，关闭 Anvil 后重新启动，并删除地址缓存：
 
