@@ -557,7 +557,7 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
 
 
     print("\n[步骤 5] Operator 生成并发布 汇总 Merkle Root...")
-    delay_window = 5
+    delay_window = 3600  # SOL-05 修复后最小审查窗口为 1 小时
     fake_root_manifest = bytes("root_manifest", "utf-8").rjust(32, b'\0')
     
     # 发布累积金额需要配合 epochDeltaAmount

@@ -169,7 +169,7 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         bytes32 manifestHash;
     }
 
-    // taskId => 任务配置，“我要建立一个名为 tasks 的登记簿。以后只要你给我一个编号（bytes32），我就能立刻从这个登记簿里把对应的任务详情（TaskConfig）找出来给你看。”
+    // taskId => 任务配置，"我要建立一个名为 tasks 的登记簿。以后只要你给我一个编号（bytes32），我就能立刻从这个登记簿里把对应的任务详情（TaskConfig）找出来给你看。"
     mapping(bytes32 => TaskConfig) public tasks;
 
     // taskId => 合格信息
@@ -185,7 +185,7 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
     mapping(address => ActiveRoot) public activeRoots;
 
     // 用户累计已领取金额：account => token => claimedAmount
-    // 注意：这里是“累计已领”，不是按 task 记录，而是按 token 记录
+    // 注意：这里是"累计已领"，不是按 task 记录，而是按 token 记录
     mapping(address => mapping(address => uint256)) public claimed;
 
     // token => 已结算但尚未被分配进 root 的金额
@@ -203,8 +203,11 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
     // token => 已计提但尚未提现的平台费
     mapping(address => uint256) public platformFeeBalances;
 
+    // 最小审查窗口时间（秒），防止 operator 设置 delayWindow=0 绕过 guardian 审查
+    uint64 public constant MIN_DELAY_WINDOW = 3600; // 1 hour minimum
+
     // 给未来升级预留存储槽，避免存储冲突
-    uint256[39] private __gap;
+    uint256[38] private __gap;
 
     // =========================
     //         事件
@@ -462,10 +465,11 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
 
     /**
      * @dev 更新操作员
-     * 注意：这里要求传 oldOperator，且无校验 oldOperator 当前是否真有该角色
+     * SOL-08 修复：显式验证 oldOperator 确实持有 OPERATOR_ROLE，防止传错地址时静默 no-op
      */
     function updateOperator(address oldOperator, address newOperator) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(newOperator != address(0), "bad operator");
+        require(hasRole(OPERATOR_ROLE, oldOperator), "oldOperator lacks role");
         _revokeRole(OPERATOR_ROLE, oldOperator);
         _grantRole(OPERATOR_ROLE, newOperator);
         emit OperatorUpdated(oldOperator, newOperator);
@@ -473,9 +477,11 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
 
     /**
      * @dev 更新守护者
+     * SOL-08 修复：显式验证 oldGuardian 确实持有 GUARDIAN_ROLE
      */
     function updateGuardian(address oldGuardian, address newGuardian) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(newGuardian != address(0), "bad guardian");
+        require(hasRole(GUARDIAN_ROLE, oldGuardian), "oldGuardian lacks role");
         _revokeRole(GUARDIAN_ROLE, oldGuardian);
         _grantRole(GUARDIAN_ROLE, newGuardian);
         emit GuardianUpdated(oldGuardian, newGuardian);
@@ -541,8 +547,8 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
      * @param basePool                基础奖励池
      * @param lotteryRewardPerWinner  单个中奖额外奖励
      * @param lotteryWinnerCount      计划中奖人数
-     * @param qualifyDeadline         资格确认截止时间“报名/参与结束，名单冻结的时间”
-     * @param settlementDeadline      结算截止时间“最晚必须把奖金和退款算完的时间”
+     * @param qualifyDeadline         资格确认截止时间"报名/参与结束，名单冻结的时间"
+     * @param settlementDeadline      结算截止时间"最晚必须把奖金和退款算完的时间"
      * @param seedCommit              对 seedReveal 的承诺
      没问题
      */
@@ -761,7 +767,7 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
             platformFeeAmount: platformFeeAmount
         });
 
-        // 把这次结算中应发给用户的金额，放进“已结算但还没分配到 root”的池子
+        // 把这次结算中应发给用户的金额，放进"已结算但还没分配到 root"的池子
         settledButUnallocated[t.token] += payoutAmount;
 
         // 只有成功结算才计提平台费；取消和超时强退不收费。
@@ -866,11 +872,16 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
 
         require(epochDeltaAmount > 0, "Zero delta");
 
-        // 不能超过当前“已结算但未分配”的金额
+        // 不能超过当前"已结算但未分配"的金额
         require(epochDeltaAmount <= settledButUnallocated[token], "Delta exceeds unallocated");
 
-        // 审核期结束时间
-        uint64 activateAfter = uint64(block.timestamp + delayWindow);
+        // SOL-05 修复：强制最小审查窗口，防止 operator 设置 0 绕过 guardian 审查
+        require(delayWindow >= MIN_DELAY_WINDOW, "Delay too short");
+
+        // SOL-05 修复：使用 uint256 计算后再安全转换，防止 uint64 截断导致溢出绕过
+        uint256 activateAfterCalc = block.timestamp + uint256(delayWindow);
+        require(activateAfterCalc <= type(uint64).max, "Delay overflow");
+        uint64 activateAfter = uint64(activateAfterCalc);
 
         pendingRoots[token] = PendingRoot({
             rootId: rootId,
@@ -948,7 +959,7 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
      * @param merkleProof      Merkle 证明
      * @param recipient        实际收款地址
      *
-     * 这里采用“累计金额”模型：
+     * 这里采用"累计金额"模型：
      * - root 中存的是用户累计可领总额
      * - 合约记录用户之前已经领了多少
      * - 本次只能领 delta = cumulativeAmount - alreadyClaimed
@@ -973,6 +984,9 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
 
         // 验证 proof
         require(MerkleProof.verify(merkleProof, a.merkleRoot, leaf), "Invalid proof");
+
+        // SOL-04 修复：用户累计领取不得超过当前 root 的 totalAllocated
+        require(cumulativeAmount <= a.totalAllocated, "Exceeds total allocated");
 
         // 已领取累计值
         uint256 alreadyClaimed = claimed[msg.sender][token];
@@ -1001,6 +1015,29 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         }
 
         return cumulativeAmount - alreadyClaimed;
+    }
+
+    /**
+     * @dev SOL-10 修复：当代币被移除白名单后，已结算但未分配的资金无法通过正常 publishPendingRoot 路径释放。
+     * 管理员可调用此函数将被锁资金紧急转出给指定接收者（通常是受影响用户的多签合约）。
+     * 仅在代币已从白名单移除、且存在 settledButUnallocated 余额时可用。
+     */
+    event EmergencyFundsReleased(address indexed token, address indexed recipient, uint256 amount);
+
+    function emergencyReleaseDelistedFunds(address token, address recipient, uint256 amount)
+        external
+        onlyRole(DEFAULT_ADMIN_ROLE)
+        nonReentrant
+    {
+        require(recipient != address(0), "bad recipient");
+        require(!tokenWhitelist[token], "Token still whitelisted");
+        require(amount > 0, "zero amount");
+        require(amount <= settledButUnallocated[token], "Exceeds unallocated");
+
+        settledButUnallocated[token] -= amount;
+        IERC20(token).safeTransfer(recipient, amount);
+
+        emit EmergencyFundsReleased(token, recipient, amount);
     }
 
     function _calculatePlatformFee(uint96 totalBudget, uint16 feeBps) internal pure returns (uint96) {

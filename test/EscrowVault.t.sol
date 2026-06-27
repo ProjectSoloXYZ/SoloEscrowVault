@@ -688,8 +688,9 @@ contract EscrowVaultTest is Test {
         _settlePayout(epochDelta);
 
         vm.prank(operator);
-        vault.publishPendingRoot(address(token), rootId, _claimLeaf(account, rootId, cumulativeAmount), epochDelta, 0, keccak256("root"));
+        vault.publishPendingRoot(address(token), rootId, _claimLeaf(account, rootId, cumulativeAmount), epochDelta, 1 hours, keccak256("root"));
 
+        vm.warp(block.timestamp + 1 hours + 1);
         vault.activateRoot(address(token), rootId);
     }
 

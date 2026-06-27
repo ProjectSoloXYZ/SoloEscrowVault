@@ -21,6 +21,7 @@ contract SimpleToken {
     }
     
     function transfer(address to, uint256 value) public virtual returns (bool) {
+        require(to != address(0), "Transfer to zero address");
         require(balanceOf[msg.sender] >= value, "Insufficient balance");
         balanceOf[msg.sender] -= value;
         balanceOf[to] += value;
@@ -35,6 +36,7 @@ contract SimpleToken {
     }
     
     function transferFrom(address from, address to, uint256 value) public virtual returns (bool) {
+        require(to != address(0), "Transfer to zero address");
         require(balanceOf[from] >= value, "Insufficient balance");
         require(allowance[from][msg.sender] >= value, "Insufficient allowance");
         balanceOf[from] -= value;
