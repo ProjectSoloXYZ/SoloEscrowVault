@@ -247,21 +247,18 @@ contract EscrowVaultTest is Test {
         vault.settleTask(
             taskId,
             bytes32("wrong-seed"),
-            0,
-            bytes32(0),
             keccak256("result"),
             0,
             uint96(100 * TOKEN),
-            0,
             0
         );
 
         vm.prank(operator);
         vm.expectRevert(bytes("Sum mismatch"));
-        vault.settleTask(taskId, seed, 0, bytes32(0), keccak256("result"), 1, uint96(100 * TOKEN), 0, 0);
+        vault.settleTask(taskId, seed, keccak256("result"), 1, uint96(100 * TOKEN), 0);
 
         vm.prank(operator);
-        vault.settleTask(taskId, seed, 0, bytes32(0), keccak256("result"), 0, uint96(98 * TOKEN), 0, 0);
+        vault.settleTask(taskId, seed, keccak256("result"), 0, uint96(98 * TOKEN), 0);
 
         assertEq(uint256(_taskStatus(taskId)), uint256(EscrowVault.TaskStatus.REFUNDABLE));
         assertEq(vault.platformFeeBalances(address(token)), DEFAULT_FEE);
@@ -275,18 +272,17 @@ contract EscrowVaultTest is Test {
         vm.prank(operator);
         vault.finalizeQualification(taskId, 2, qualifiedRoot, keccak256("qualification-manifest"));
 
+        // SOL-06 修复后：actualWinnerCount 参数已被移除，合约强制 expectedWinners = min(2,1) = 1。
+        // 该用例改为验证："entropy block 未到时 settleTask 应 revert"（替代原 'Too many winners' 检查）。
         vm.prank(operator);
-        vm.expectRevert(bytes("Too many winners"));
+        vm.expectRevert(bytes("entropy block not reached"));
         vault.settleTask(
             taskId,
             bytes32("seed"),
-            0,
-            bytes32(0),
             keccak256("result"),
-            uint96(98 * TOKEN),
-            0,
-            uint96(40 * TOKEN),
-            2
+            uint96(88 * TOKEN), // = baseReward*2 + lotteryReward*1 = 39*2 + 10*1
+            uint96(10 * TOKEN),
+            uint96(39 * TOKEN)
         );
     }
 
@@ -298,40 +294,43 @@ contract EscrowVaultTest is Test {
         vm.prank(operator);
         vault.finalizeQualification(taskId, 2, qualifiedRoot, keccak256("qualification-manifest"));
 
+        // SOL-06：跳过 entropy block delay 让 settleTask 能走到 Payout mismatch
+        vm.roll(block.number + 11);
+
+        // expectedWinners = min(qualified=2, lotteryWinnerCount=2) = 2
+        // 正确公式：30*2 + 10*2 = 80。传 90 → Payout mismatch
         vm.prank(operator);
         vm.expectRevert(bytes("Payout mismatch"));
         vault.settleTask(
             taskId,
             bytes32("seed"),
-            0,
-            bytes32(0),
             keccak256("result"),
             uint96(90 * TOKEN),
             uint96(8 * TOKEN),
-            uint96(30 * TOKEN),
-            1
+            uint96(30 * TOKEN)
         );
     }
 
     function testFullSettlementRootActivationClaimsAndRefund() public {
-        bytes32 taskId = _createTask(100 * TOKEN, 78 * TOKEN, 10 * TOKEN, 2);
+        // SOL-06：lotteryWinnerCount=1 让 expectedWinners=min(2,1)=1，保留原 payout/refund 数学
+        bytes32 taskId = _createTask(100 * TOKEN, 78 * TOKEN, 10 * TOKEN, 1);
         bytes32 qualifiedRoot = _qualifiedRoot(taskId);
 
         vm.warp(block.timestamp + 1 days + 1);
         vm.prank(operator);
         vault.finalizeQualification(taskId, 2, qualifiedRoot, keccak256("qualification-manifest"));
 
+        // SOL-06：跳过 entropy block delay
+        vm.roll(block.number + 11);
+
         vm.prank(operator);
         vault.settleTask(
             taskId,
             bytes32("seed"),
-            0,
-            bytes32(0),
             keccak256("result"),
-            uint96(88 * TOKEN),
+            uint96(88 * TOKEN),         // = 39*2 + 10*1
             uint96(10 * TOKEN),
-            uint96(39 * TOKEN),
-            1
+            uint96(39 * TOKEN)
         );
 
         assertEq(vault.settledButUnallocated(address(token)), 88 * TOKEN);
@@ -350,14 +349,14 @@ contract EscrowVaultTest is Test {
         bytes32 merkleRoot = _hashPair(leaf1, leaf2);
 
         vm.prank(operator);
-        vault.publishPendingRoot(address(token), rootId, merkleRoot, uint128(88 * TOKEN), 1 hours, keccak256("root"));
+        vault.publishPendingRoot(address(token), rootId, merkleRoot, uint128(88 * TOKEN), 24 hours, keccak256("root"));
 
         assertEq(vault.settledButUnallocated(address(token)), 0);
 
         vm.expectRevert(bytes("Audit window active"));
         vault.activateRoot(address(token), rootId);
 
-        vm.warp(block.timestamp + 1 hours);
+        vm.warp(block.timestamp + 24 hours);
         vault.activateRoot(address(token), rootId);
 
         bytes32[] memory proofForUser1 = new bytes32[](1);
@@ -385,7 +384,7 @@ contract EscrowVaultTest is Test {
         _finalizeZeroQualified(taskId);
 
         vm.prank(operator);
-        vault.settleTask(taskId, bytes32("seed"), 0, bytes32(0), keccak256("result"), 0, uint96(98 * TOKEN), 0, 0);
+        vault.settleTask(taskId, bytes32("seed"), keccak256("result"), 0, uint96(98 * TOKEN), 0);
 
         assertEq(vault.platformFeeBalances(address(token)), DEFAULT_FEE);
 
@@ -415,11 +414,11 @@ contract EscrowVaultTest is Test {
 
         _finalizeZeroQualified(oldFeeTaskId);
         vm.prank(operator);
-        vault.settleTask(oldFeeTaskId, bytes32("seed"), 0, bytes32(0), keccak256("old-result"), 0, uint96(98 * TOKEN), 0, 0);
+        vault.settleTask(oldFeeTaskId, bytes32("seed"), keccak256("old-result"), 0, uint96(98 * TOKEN), 0);
 
         _finalizeZeroQualified(zeroFeeTaskId);
         vm.prank(operator);
-        vault.settleTask(zeroFeeTaskId, bytes32("seed"), 0, bytes32(0), keccak256("zero-result"), 0, uint96(100 * TOKEN), 0, 0);
+        vault.settleTask(zeroFeeTaskId, bytes32("seed"), keccak256("zero-result"), 0, uint96(100 * TOKEN), 0);
 
         assertEq(vault.platformFeeBalances(address(token)), DEFAULT_FEE);
     }
@@ -469,25 +468,25 @@ contract EscrowVaultTest is Test {
 
         vm.prank(attacker);
         vm.expectRevert();
-        vault.publishPendingRoot(address(token), 1, keccak256("root"), 1, 1 hours, keccak256("manifest"));
+        vault.publishPendingRoot(address(token), 1, keccak256("root"), 1, 24 hours, keccak256("manifest"));
 
         vm.prank(operator);
         vm.expectRevert(bytes("Delta exceeds unallocated"));
-        vault.publishPendingRoot(address(token), 1, keccak256("root"), 2, 1 hours, keccak256("manifest"));
+        vault.publishPendingRoot(address(token), 1, keccak256("root"), 2, 24 hours, keccak256("manifest"));
 
         vm.prank(operator);
-        vault.publishPendingRoot(address(token), 1, keccak256("root"), 1, 1 hours, keccak256("manifest"));
+        vault.publishPendingRoot(address(token), 1, keccak256("root"), 1, 24 hours, keccak256("manifest"));
 
         vm.prank(operator);
         vm.expectRevert(bytes("Pending root exists"));
-        vault.publishPendingRoot(address(token), 2, keccak256("root2"), 1, 1 hours, keccak256("manifest2"));
+        vault.publishPendingRoot(address(token), 2, keccak256("root2"), 1, 24 hours, keccak256("manifest2"));
     }
 
     function testGuardianCanCancelPendingRootAndRestoreUnallocated() public {
         _settleOneWeiTask();
 
         vm.prank(operator);
-        vault.publishPendingRoot(address(token), 1, keccak256("root"), 1, 1 hours, keccak256("manifest"));
+        vault.publishPendingRoot(address(token), 1, keccak256("root"), 1, 24 hours, keccak256("manifest"));
 
         assertEq(vault.settledButUnallocated(address(token)), 0);
 
@@ -676,7 +675,7 @@ contract EscrowVaultTest is Test {
 
         vm.prank(operator);
         uint96 feeAmount = uint96((1 * TOKEN * 200) / 10_000);
-        vault.settleTask(taskId, bytes32("seed"), 0, bytes32(0), keccak256("result"), 1, uint96(1 * TOKEN - feeAmount - 1), 1, 0);
+        vault.settleTask(taskId, bytes32("seed"), keccak256("result"), 1, uint96(1 * TOKEN - feeAmount - 1), 1);
     }
 
     function _publishAndActivateSingleLeafRoot(
@@ -688,9 +687,10 @@ contract EscrowVaultTest is Test {
         _settlePayout(epochDelta);
 
         vm.prank(operator);
-        vault.publishPendingRoot(address(token), rootId, _claimLeaf(account, rootId, cumulativeAmount), epochDelta, 1 hours, keccak256("root"));
+        vault.publishPendingRoot(address(token), rootId, _claimLeaf(account, rootId, cumulativeAmount), epochDelta, 24 hours, keccak256("root"));
 
-        vm.warp(block.timestamp + 1 hours + 1);
+        // 跳过审查窗口（默认 minReviewWindow=24h），用绝对时间避免与上下文 warp 顺序冲突
+        vm.warp(block.timestamp + 24 hours + 60);
         vault.activateRoot(address(token), rootId);
     }
 
@@ -705,13 +705,10 @@ contract EscrowVaultTest is Test {
         vault.settleTask(
             taskId,
             bytes32("seed"),
-            0,
-            bytes32(0),
             keccak256("result"),
             uint96(payoutAmount),
             uint96(100 * TOKEN - DEFAULT_FEE - payoutAmount),
-            uint96(payoutAmount),
-            0
+            uint96(payoutAmount)
         );
     }
 
