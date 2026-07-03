@@ -342,3 +342,42 @@ python scripts/deploy_governance.py
 ### Acknowledged（2 项，无需代码修改）
 - SOL-06：后续 v2.0 集成 Chainlink VRF
 - SOL-09：确认为预期设计
+
+---
+
+## 整改更新（2026-06-30，分支 `fix/audit-remediation`）
+
+> 本节覆盖前文初版回复中关于 SOL-04/05/06/07/08/10 的内容。最终落地方案以本节为准，前文保留以备审计追溯。
+> 详细技术说明见 `docs/security_model.md` 的 "Audit Remediation Notes" 章节，以及仓库 `remediation/` 下的施工文档。
+
+### 总路线（2026-06-30 负责人拍板）
+
+经过项目内部讨论，**SOL-06 不再走 Chainlink VRF 路线**，改为「合约硬保证资金安全 + 链下确定性可复算 + Guardian 窗口挑战」的路线 A 硬化方案。理由：业务为小额高频任务（单任务奖金约 1 USDC，单人 0.x USDC），VRF 外部依赖带来的 gas 开销与运营复杂度不与该量级匹配；Guardian 窗口挑战 + 链下可复算已能将抽奖正确性问题挡在审查窗口内。
+
+### 已完成的合约整改
+
+| Finding | 严重级 | 整改方式 | 代码位置 |
+|---|---|---|---|
+| SOL-04 | Medium | 引入 `totalClaimed[token]`，`claim` 内强制聚合守恒 `totalClaimed[token] + delta ≤ activeRoots[token].totalAllocated`。废弃了本地早期的"单用户封顶"方案（多用户合谋仍可超发） | `contracts/EscrowVault.sol` 的 `claim` |
+| SOL-05 | Medium | 新增 `MIN_REVIEW_FLOOR=1h` / `MAX_DELAY_WINDOW=30d` 常量与可配置 `minReviewWindow`（默认 24h）；`publishPendingRoot` 校验 `[minReviewWindow, MAX_DELAY_WINDOW]`；`activateAfter` 用 uint256 计算后再 bound-check 转 uint64，杜绝截断绕过 | `publishPendingRoot` / `setMinReviewWindow` / `initializeV3` |
+| SOL-06 | Minor | ① `finalizeQualification` 锁定合格名单后记录 `taskEntropyBlock = block.number + 10`；② `settleTask` 移除 Operator 传入的 `entropyValue` 参数，改由合约从 `blockhash(taskEntropyBlock) + seedReveal` 派生最终熵；③ `actualWinnerCount` 由合约确定性算出 `min(qualifiedCount, lotteryWinnerCount)`，不再信 Operator 报送；④ 链下 Guardian 凭 `taskEntropy[taskId]` + 公开算法可独立复算 root 并在审查窗口内挑战 | `finalizeQualification` / `settleTask` |
+| SOL-07 | Minor | `SimpleToken.transfer` / `transferFrom` 已加 `to != address(0)` 兜底；文件顶部新增 NatSpec 警示，明确标注为 **测试 mock，生产不使用**，申请 out-of-scope | `contracts/SimpleToken.sol` |
+| SOL-08 | Info | `updateOperator` / `updateGuardian` 增加 `require(hasRole(...))` 校验，旧地址不持角色时 revert，杜绝"撤销空转 + 双持有者"风险 | `EscrowVault.sol` L470/L482 |
+| SOL-09 | Discussion | 累计 root 模型确认保留（小额 gas 刚需）；新增运营约束写入 `docs/security_model.md`：① 旧 proof 在新 root 激活后失效；② 链下 root 生成器必须保留所有"老 root 仍有未领余额"用户的最新累计额，由链下单测卡死 | `docs/security_model.md` |
+| SOL-10 | Minor | `publishPendingRoot` 白名单条件放宽为 `tokenWhitelist[token] || settledButUnallocated[token] > 0`，允许下架 token 走正常清退路径；`createTask` 仍只放白名单 token；**不引入** admin 提款函数 | `publishPendingRoot` |
+
+### 升级注意（已部署代理）
+
+- 整改新增顶层状态变量：`minReviewWindow`、`totalClaimed`、`taskEntropyBlock`、`taskEntropy`，共占 4 个槽位；`__gap` 已从 39 减为 34（实际：初次审计基线 39 → 本地 5f61dee 已用 1 → 本次再用 3）。
+- 新增 `initializeV3()`（`reinitializer(3)`）用于把 `minReviewWindow` 初始化为 24h；旧代理升级到新实现后**必须**由 admin 调用一次，否则 `publishPendingRoot` 会因 `minReviewWindow=0` 把所有 delay 都拒掉。
+- 未修改任何已有 struct（`TaskConfig` / `Qualification` / `Settlement` / `PendingRoot` / `ActiveRoot`），存储布局向后兼容。
+
+### 测试与验收
+
+- 原回归用例：21 / 21 通过（`test/EscrowVault.t.sol`）。
+- 整改专项验收用例：21 / 21 通过（`test/RemediationAudit.t.sol`），覆盖 SOL-04 多用户合谋拦截、SOL-05 边界、SOL-06 熵分支、SOL-07/08/10 验收点。
+- 合计 42 / 42 通过，`forge build` 无错误。
+
+### 治理类（SOL-01/02/03）
+
+不在本次合约整改范围，按部署清单（多签 + Timelock）配置后再补充关闭信息。
