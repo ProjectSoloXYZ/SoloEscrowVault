@@ -203,11 +203,30 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
     // token => 已计提但尚未提现的平台费
     mapping(address => uint256) public platformFeeBalances;
 
-    // 最小审查窗口时间（秒），防止 operator 设置 delayWindow=0 绕过 guardian 审查
-    uint64 public constant MIN_DELAY_WINDOW = 3600; // 1 hour minimum
+    // SOL-05 修复（v2）：审查窗口三件套
+    // - MIN_REVIEW_FLOOR: 不可调底线，管理员也不能把 minReviewWindow 设到此值以下
+    // - MAX_DELAY_WINDOW: 上限，防 Operator griefing 把窗口拉到无法激活
+    // - minReviewWindow:  管理员可配置的当前最小窗口，默认 24h（给 Guardian 复算+多签集齐时间）
+    uint64 public constant MIN_REVIEW_FLOOR = 1 hours;
+    uint64 public constant MAX_DELAY_WINDOW = 30 days;
+    uint64 public minReviewWindow; // 占 1 个 __gap 槽
+
+    // SOL-04 修复（v2）：每个 token 累计已发放金额，用于聚合守恒
+    // claim() 内强制：totalClaimed[token] + delta <= activeRoots[token].totalAllocated
+    // 杜绝"多用户合谋写满 cumulativeAmount 跨任务超领"风险
+    mapping(address => uint256) public totalClaimed; // 占 1 个 __gap 槽
+
+    // SOL-06 修复：熵硬化 + 确定性可复算抽奖
+    // - taskEntropyBlock: 在 finalizeQualification 锁定合格名单后第 K=ENTROPY_BLOCK_DELAY 块取 blockhash
+    //   保证熵来源在锁名单之后、Operator 无法 grind 合格名单
+    // - taskEntropy:      settleTask 内派生的最终熵 = keccak256(seedReveal, blockhash(taskEntropyBlock))
+    //   任何人凭它 + 公开算法可独立复算中奖名单（链下复算，Guardian 在审查窗口内挑战）
+    uint64 public constant ENTROPY_BLOCK_DELAY = 10;
+    mapping(bytes32 => uint64)  public taskEntropyBlock; // 占 1 个 __gap 槽
+    mapping(bytes32 => bytes32) public taskEntropy;      // 占 1 个 __gap 槽
 
     // 给未来升级预留存储槽，避免存储冲突
-    uint256[38] private __gap;
+    uint256[34] private __gap;
 
     // =========================
     //         事件
@@ -397,6 +416,11 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
      */
     event PlatformFeeWithdrawn(address indexed token, address indexed recipient, uint256 amount);
 
+    /**
+     * @dev SOL-05：最小审查窗口更新事件
+     */
+    event MinReviewWindowUpdated(uint64 oldWindow, uint64 newWindow);
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         // 禁用实现合约的初始化，防止实现合约被人单独初始化劫持
@@ -427,6 +451,10 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         platformTreasury = initialAdmin;
         emit PlatformFeeBpsUpdated(0, DEFAULT_PLATFORM_FEE_BPS);
         emit PlatformTreasuryUpdated(address(0), initialAdmin);
+
+        // SOL-05：新部署时默认 24h 审查窗口
+        minReviewWindow = 24 hours;
+        emit MinReviewWindowUpdated(0, 24 hours);
     }
 
     /**
@@ -439,6 +467,17 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         platformTreasury = initialTreasury;
         emit PlatformFeeBpsUpdated(0, DEFAULT_PLATFORM_FEE_BPS);
         emit PlatformTreasuryUpdated(address(0), initialTreasury);
+    }
+
+    /**
+     * @dev V3 初始化：审计整改升级。
+     * - SOL-05：给已部署代理设置 minReviewWindow 默认值（24h）
+     * 旧代理升级到包含本整改的实现时必须调用一次，否则 publishPendingRoot 将因 minReviewWindow=0 退化。
+     */
+    function initializeV3() external onlyRole(DEFAULT_ADMIN_ROLE) reinitializer(3) {
+        uint64 old = minReviewWindow;
+        minReviewWindow = 24 hours;
+        emit MinReviewWindowUpdated(old, 24 hours);
     }
 
     /**
@@ -505,6 +544,17 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         address oldTreasury = platformTreasury;
         platformTreasury = newTreasury;
         emit PlatformTreasuryUpdated(oldTreasury, newTreasury);
+    }
+
+    /**
+     * @dev SOL-05：管理员调整最小审查窗口（必须 ≥ MIN_REVIEW_FLOOR 且 ≤ MAX_DELAY_WINDOW）。
+     */
+    function setMinReviewWindow(uint64 newWindow) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(newWindow >= MIN_REVIEW_FLOOR, "below floor");
+        require(newWindow <= MAX_DELAY_WINDOW, "above ceiling");
+        uint64 old = minReviewWindow;
+        minReviewWindow = newWindow;
+        emit MinReviewWindowUpdated(old, newWindow);
     }
 
     /**
@@ -680,31 +730,34 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         // 进入 QUALIFIED 状态
         t.status = TaskStatus.QUALIFIED;
 
+        // SOL-06：锁定合格名单后第 K 块作为取熵区块
+        // settleTask 必须在该块之后、且 256 块内（取得到 blockhash）完成
+        taskEntropyBlock[taskId] = uint64(block.number) + ENTROPY_BLOCK_DELAY;
+
         emit QualificationFinalized(taskId, qualifiedCount, qualifiedRoot, qualificationManifestHash);
     }
 
     /**
      * @dev Operator 完成任务结算
+     * SOL-06 修复：
+     * - 移除 Operator 传入的 entropyValue（改由合约从 blockhash(taskEntropyBlock) + seedReveal 派生）
+     * - actualWinnerCount 由合约确定性算出（min(qualifiedCount, lotteryWinnerCount)），不再信 Operator 报送
+     * - 兼容：entropyRef 参数保留占位但不再用于赋值（最终落地的 entropyRef = taskEntropyBlock）
+     *
      * @param taskId                  任务 ID
      * @param seedReveal              提交 seed reveal，用于和 commit 对上
-     * @param entropyRef              外部熵来源引用
-     * @param entropyValue            外部熵值
-     * @param resultManifestHash      结果清单哈希
+     * @param resultManifestHash      结果清单哈希（链下中奖名单文件哈希）
      * @param payoutAmount            要分给用户的总金额
      * @param refundableAmount        可退 Sponsor 的金额
      * @param baseRewardPerQualified  每个合格用户的基础奖励
-     * @param actualWinnerCount       实际中奖人数
      */
     function settleTask(
         bytes32 taskId,
         bytes32 seedReveal,
-        uint64 entropyRef,
-        bytes32 entropyValue,
         bytes32 resultManifestHash,
         uint96 payoutAmount,
         uint96 refundableAmount,
-        uint96 baseRewardPerQualified,
-        uint16 actualWinnerCount
+        uint96 baseRewardPerQualified
     ) external onlyRole(OPERATOR_ROLE) whenNotPaused {
         TaskConfig storage t = tasks[taskId];
         Qualification memory q = qualifications[taskId];
@@ -721,6 +774,16 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         // reveal 必须和创建任务时的 seedCommit 对上
         require(keccak256(abi.encodePacked(seedReveal)) == t.seedCommit, "seedReveal mismatch");
 
+        // SOL-06：派生最终熵（仅当有人合格、需要抽奖时；0 人合格时熵无意义）
+        bytes32 finalEntropy;
+        uint64 eb = taskEntropyBlock[taskId];
+        if (q.qualifiedCount > 0 && t.lotteryWinnerCount > 0) {
+            require(eb != 0 && block.number > eb, "entropy block not reached");
+            bytes32 bh = blockhash(eb);
+            require(bh != bytes32(0), "entropy block expired"); // 超过 256 块取不到
+            finalEntropy = keccak256(abi.encode(seedReveal, bh));
+        }
+
         uint96 platformFeeAmount = _calculatePlatformFee(t.totalBudget, t.platformFeeBps);
 
         // 发奖金额 + 退款金额 + 平台费 = 总预算
@@ -729,14 +792,14 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
             "Sum mismatch"
         );
 
-        // 实际中奖人数不能超过计划中奖人数
-        require(actualWinnerCount <= t.lotteryWinnerCount, "Too many winners");
+        // SOL-06：中奖人数由合约确定性算出，不再由 Operator 自由报送
+        uint16 expectedWinners = q.qualifiedCount >= t.lotteryWinnerCount
+            ? t.lotteryWinnerCount
+            : uint16(q.qualifiedCount);
 
         if (q.qualifiedCount == 0) {
             // 0 个合格用户时，每人基础奖励必须为 0
             require(baseRewardPerQualified == 0, "baseReward should be 0");
-            // 0 个合格用户时，不应有中奖者
-            require(actualWinnerCount == 0, "winnerCount should be 0");
             // 0 个合格用户时，发奖总额必须为 0，资金应全额退回
             require(payoutAmount == 0, "payout must be 0 if no one qualified");
         } else {
@@ -745,27 +808,28 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
                 uint256(baseRewardPerQualified) * uint256(q.qualifiedCount) <= t.basePool,
                 "base allocation overflow"
             );
-
-            // 实际中奖人数不能大于合格人数
-            require(actualWinnerCount <= q.qualifiedCount, "winnerCount exceeds qualified");
         }
 
         uint256 expectedPayout = uint256(baseRewardPerQualified) * uint256(q.qualifiedCount)
-            + uint256(t.lotteryRewardPerWinner) * uint256(actualWinnerCount);
+            + uint256(t.lotteryRewardPerWinner) * uint256(expectedWinners);
         require(uint256(payoutAmount) == expectedPayout, "Payout mismatch");
 
+        // entropyRef 字段记录取熵区块号（链下复算时可据此 blockhash(eb) 还原最终熵）
         settlements[taskId] = Settlement({
             seedReveal: seedReveal,
-            entropyRef: entropyRef,
-            entropyValue: entropyValue,
+            entropyRef: eb,
+            entropyValue: finalEntropy,
             resultManifestHash: resultManifestHash,
             baseRewardPerQualified: baseRewardPerQualified,
-            actualWinnerCount: actualWinnerCount,
+            actualWinnerCount: expectedWinners,
             payoutAmount: payoutAmount,
             refundableAmount: refundableAmount,
             settledAt: uint64(block.timestamp),
             platformFeeAmount: platformFeeAmount
         });
+
+        // SOL-06：派生熵也单独存到 taskEntropy（方便链下/Guardian 直接读取）
+        taskEntropy[taskId] = finalEntropy;
 
         // 把这次结算中应发给用户的金额，放进"已结算但还没分配到 root"的池子
         settledButUnallocated[t.token] += payoutAmount;
@@ -782,13 +846,13 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         emit TaskSettled(
             taskId,
             seedReveal,
-            entropyRef,
-            entropyValue,
+            eb,                 // SOL-06：entropyRef = 取熵区块号
+            finalEntropy,       // SOL-06：entropyValue = 合约派生的最终熵
             resultManifestHash,
             payoutAmount,
             refundableAmount,
             baseRewardPerQualified,
-            actualWinnerCount,
+            expectedWinners,    // SOL-06：合约确定性的中奖人数
             platformFeeAmount
         );
     }
@@ -859,7 +923,14 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         uint64 delayWindow,
         bytes32 manifestHash
     ) external onlyRole(OPERATOR_ROLE) whenNotPaused {
-        require(tokenWhitelist[token], "Token not allowed");
+        // SOL-10 修复：允许对已下架但仍有未清退余额的 token 继续发 root（存量清退路径）。
+        // createTask 仍只放白名单 token（不变）→ 下架后不能开新任务，
+        // 但已结算欠用户的钱仍可通过正常 publishPendingRoot 流程清退。
+        // 不引入 admin 提款函数，避免把 Minor 修成"admin 可挪用用户资金"的中心化风险。
+        require(
+            tokenWhitelist[token] || settledButUnallocated[token] > 0,
+            "Token not allowed and nothing to wind down"
+        );
 
         // 新 rootId 必须比当前 active root 更大
         require(rootId > activeRoots[token].rootId, "rootId too small");
@@ -875,8 +946,12 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         // 不能超过当前"已结算但未分配"的金额
         require(epochDeltaAmount <= settledButUnallocated[token], "Delta exceeds unallocated");
 
-        // SOL-05 修复：强制最小审查窗口，防止 operator 设置 0 绕过 guardian 审查
-        require(delayWindow >= MIN_DELAY_WINDOW, "Delay too short");
+        // SOL-05 修复（v2）：强制 delayWindow ∈ [minReviewWindow, MAX_DELAY_WINDOW]
+        // - 下限 minReviewWindow（默认 24h，管理员可在 [MIN_REVIEW_FLOOR, MAX_DELAY_WINDOW] 内调）
+        //   防止 Operator 设 0 / 过短绕过 Guardian 审查
+        // - 上限 MAX_DELAY_WINDOW=30 天，防 Operator griefing 把窗口拉到无法激活
+        require(delayWindow >= minReviewWindow, "Delay too short");
+        require(delayWindow <= MAX_DELAY_WINDOW, "Delay too long");
 
         // SOL-05 修复：使用 uint256 计算后再安全转换，防止 uint64 截断导致溢出绕过
         uint256 activateAfterCalc = block.timestamp + uint256(delayWindow);
@@ -985,15 +1060,23 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         // 验证 proof
         require(MerkleProof.verify(merkleProof, a.merkleRoot, leaf), "Invalid proof");
 
-        // SOL-04 修复：用户累计领取不得超过当前 root 的 totalAllocated
-        require(cumulativeAmount <= a.totalAllocated, "Exceeds total allocated");
-
         // 已领取累计值
         uint256 alreadyClaimed = claimed[msg.sender][token];
         require(cumulativeAmount > alreadyClaimed, "Nothing to claim");
 
         // 本次可领取增量
         uint256 deltaAmount = cumulativeAmount - alreadyClaimed;
+
+        // SOL-04 修复（v2）：聚合守恒
+        // 合约对该 token 的累计付出永远 <= 累计已分配总额（totalAllocated）。
+        // 不管 root 里写了什么、写了多少用户多少 cumulativeAmount，
+        // 都偷不走其他任务/退款/平台费的钱。这是资金安全的硬底线。
+        // 注：单用户封顶（cumulativeAmount <= totalAllocated）不足以挡多用户合谋。
+        require(
+            totalClaimed[token] + deltaAmount <= a.totalAllocated,
+            "Exceeds allocated"
+        );
+        totalClaimed[token] += deltaAmount;
 
         // 更新已领累计值
         claimed[msg.sender][token] = cumulativeAmount;
@@ -1017,28 +1100,10 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         return cumulativeAmount - alreadyClaimed;
     }
 
-    /**
-     * @dev SOL-10 修复：当代币被移除白名单后，已结算但未分配的资金无法通过正常 publishPendingRoot 路径释放。
-     * 管理员可调用此函数将被锁资金紧急转出给指定接收者（通常是受影响用户的多签合约）。
-     * 仅在代币已从白名单移除、且存在 settledButUnallocated 余额时可用。
-     */
-    event EmergencyFundsReleased(address indexed token, address indexed recipient, uint256 amount);
-
-    function emergencyReleaseDelistedFunds(address token, address recipient, uint256 amount)
-        external
-        onlyRole(DEFAULT_ADMIN_ROLE)
-        nonReentrant
-    {
-        require(recipient != address(0), "bad recipient");
-        require(!tokenWhitelist[token], "Token still whitelisted");
-        require(amount > 0, "zero amount");
-        require(amount <= settledButUnallocated[token], "Exceeds unallocated");
-
-        settledButUnallocated[token] -= amount;
-        IERC20(token).safeTransfer(recipient, amount);
-
-        emit EmergencyFundsReleased(token, recipient, amount);
-    }
+    // SOL-10 修复（v2）：移除 emergencyReleaseDelistedFunds（admin 直接提款），
+    // 改为在 publishPendingRoot 处放宽白名单条件，让下架 token 的存量
+    // 通过原有正常清退路径（root 发布 → 审核窗口 → 用户 claim）释放，
+    // 不引入新的中心化提款权。
 
     function _calculatePlatformFee(uint96 totalBudget, uint16 feeBps) internal pure returns (uint96) {
         return uint96((uint256(totalBudget) * uint256(feeBps)) / FEE_DENOMINATOR_BPS);
