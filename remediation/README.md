@@ -66,7 +66,7 @@
 4. SOL-10 存量清退走通，且 `createTask` 对下架 token 仍 revert。
 5. SOL-07/08 按 [minor-fixes.md](minor-fixes.md)。
 6. 存储布局：新增变量正确从 `__gap` 扣除，未破坏升级兼容（见 hardening §7）。
-7. 回归测试全绿；`forge build` 无警告级别的存储/可见性问题。
+7. 回归测试全绿；`forge build` 无编译错误，且无存储布局/可见性相关告警（测试文件中的 unsafe-typecast 为 lint 级提示，不在此列）。
 
 ---
 

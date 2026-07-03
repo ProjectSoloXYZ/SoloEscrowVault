@@ -219,15 +219,16 @@ def create_and_settle_task(escrow, token, token_addr, payout_amount):
         task_id, 1, keccak256(b"qualified"), keccak256(b"manifest")
     ), "operator")
 
-    # settleTask
+    # settleTask（SOL-06 硬化后签名：6 参数，Operator 不再传入熵/中奖人数）
     platform_fee = budget * 200 // 10000  # 2%
     refund = budget - payout_amount - platform_fee
 
+    # 1 人合格、无抽奖（lotteryWinnerCount=0），故 baseRewardPerQualified = payoutAmount
     send_tx(escrow.functions.settleTask(
-        task_id, seed_secret, 0, bytes(32),
+        task_id, seed_secret,
         keccak256(b"result"),
         payout_amount, refund,
-        payout_amount, 0  # baseRewardPerQualified = payoutAmount, 0 winners
+        payout_amount
     ), "operator")
 
     return task_id
@@ -255,12 +256,13 @@ def test_sol04(token_addr, escrow_addr):
     leaf = encode_leaf(accounts["user1"].address, token_addr, root_id, inflated_amount)
     merkle_root = leaf  # 单叶树，root = leaf
 
+    # 默认最小审查窗口为 24h（SOL-05），delayWindow 必须 >= 86400
     send_tx(escrow.functions.publishPendingRoot(
-        token_addr, root_id, merkle_root, payout, 3600, keccak256(b"manifest")
+        token_addr, root_id, merkle_root, payout, 86400, keccak256(b"manifest")
     ), "operator")
 
     # 等待并激活
-    w3.provider.make_request("evm_increaseTime", [3601])
+    w3.provider.make_request("evm_increaseTime", [86401])
     w3.provider.make_request("evm_mine", [])
     send_tx(escrow.functions.activateRoot(token_addr, root_id), "admin")
 
@@ -273,10 +275,10 @@ def test_sol04(token_addr, escrow_addr):
     reverted = send_tx_expect_revert(
         escrow.functions.claim(token_addr, root_id, inflated_amount, proof, accounts["user1"].address),
         "user1",
-        "Exceeds total allocated"
+        "Exceeds allocated"
     )
     assert reverted
-    print("  ✅ SOL-04 验证通过: 超额 claim 被正确 revert (Exceeds total allocated)\n")
+    print("  ✅ SOL-04 验证通过: 超额 claim 被正确 revert (Exceeds allocated)\n")
 
 
 # ==========================================
@@ -314,22 +316,22 @@ def test_sol05(token_addr, escrow_addr):
     assert reverted
     print("  ✅ delayWindow=0 被正确 revert (Delay too short)")
 
-    # 测试 2: delayWindow = 100 (< 3600) → 应该 revert
+    # 测试 2: delayWindow = 3600 (< 24h 默认下限) → 应该 revert
     reverted = send_tx_expect_revert(
         escrow.functions.publishPendingRoot(
-            token_addr, root_id, keccak256(b"root"), payout, 100, keccak256(b"m")
+            token_addr, root_id, keccak256(b"root"), payout, 3600, keccak256(b"m")
         ),
         "operator",
         "Delay too short"
     )
     assert reverted
-    print("  ✅ delayWindow=100 被正确 revert (Delay too short)")
+    print("  ✅ delayWindow=3600 被正确 revert (Delay too short)")
 
-    # 测试 3: delayWindow = 3600 → 应该成功
+    # 测试 3: delayWindow = 86400 (=24h 默认下限) → 应该成功
     send_tx(escrow.functions.publishPendingRoot(
-        token_addr, root_id, keccak256(b"root"), payout, 3600, keccak256(b"m")
+        token_addr, root_id, keccak256(b"root"), payout, 86400, keccak256(b"m")
     ), "operator")
-    print("  ✅ delayWindow=3600 正常发布成功")
+    print("  ✅ delayWindow=86400 正常发布成功")
 
     # 清理 pending root
     send_tx(escrow.functions.cancelPendingRoot(token_addr, root_id), "guardian")
@@ -422,7 +424,7 @@ def test_sol08(escrow_addr):
 # ==========================================
 def test_sol10(token_addr, escrow_addr):
     print("─" * 60)
-    print("TEST SOL-10: 代币下架后紧急释放资金")
+    print("TEST SOL-10: 代币下架后走存量清退（已移除 admin 直接提款函数）")
     print("─" * 60)
 
     escrow = w3.eth.contract(address=escrow_addr, abi=ESCROW_ABI)
@@ -436,58 +438,51 @@ def test_sol10(token_addr, escrow_addr):
     print(f"  当前 settledButUnallocated: {unallocated / 10**18} Token")
     assert unallocated >= payout
 
-    # 测试 1: 代币仍在白名单时调用 → 应 revert
-    reverted = send_tx_expect_revert(
-        escrow.functions.emergencyReleaseDelistedFunds(
-            token_addr, accounts["admin"].address, payout
-        ),
-        "admin",
-        "Token still whitelisted"
-    )
-    assert reverted
-    print("  ✅ 代币在白名单时调用被 revert (Token still whitelisted)")
-
-    # 移除代币白名单
+    # 下架 token
     send_tx(escrow.functions.setTokenWhitelist(token_addr, False), "admin")
     print("  ✅ 代币已从白名单移除")
 
-    # 测试 2: publishPendingRoot 应该失败（代币已下架）
-    pending = escrow.functions.pendingRoots(token_addr).call()
-    if pending[0] > 0:
-        send_tx(escrow.functions.cancelPendingRoot(token_addr, pending[0]), "guardian")
-
-    active = escrow.functions.activeRoots(token_addr).call()
-    root_id = active[0] + 1
-
+    # 测试 1: createTask 对下架 token 必须 revert（不能再用下架 token 发新任务）
+    latest = w3.eth.get_block("latest")["timestamp"]
     reverted = send_tx_expect_revert(
-        escrow.functions.publishPendingRoot(
-            token_addr, root_id, keccak256(b"root"), payout, 3600, keccak256(b"m")
+        escrow.functions.createTask(
+            keccak256(b"sol10-new-task"), token_addr,
+            1 * 10**18, 1 * 10**18, 0, 0,
+            latest + 60, latest + 3600,
+            keccak256(bytes(32))
         ),
-        "operator",
+        "sponsor",
         "Token not allowed"
     )
     assert reverted
-    print("  ✅ 代币下架后 publishPendingRoot 被正确阻止")
+    print("  ✅ 下架后 createTask 被正确阻止 (Token not allowed)")
 
-    # 测试 3: emergencyReleaseDelistedFunds 应该成功
-    admin_balance_before = token.functions.balanceOf(accounts["admin"].address).call()
-    send_tx(escrow.functions.emergencyReleaseDelistedFunds(
-        token_addr, accounts["admin"].address, payout
-    ), "admin")
-    admin_balance_after = token.functions.balanceOf(accounts["admin"].address).call()
+    # 测试 2: 下架 token 仍可通过正常 root 路径清退存量（SOL-10 修复后的清退方式）
+    active = escrow.functions.activeRoots(token_addr).call()
+    root_id = active[0] + 1
+    # 单叶 root：leaf 即 root，用户凭空 proof 领取
+    leaf = encode_leaf(accounts["user1"].address, token_addr, root_id, payout)
+    send_tx(escrow.functions.publishPendingRoot(
+        token_addr, root_id, leaf, payout, 86400, keccak256(b"wind-down")
+    ), "operator")
+    w3.provider.make_request("evm_increaseTime", [86401])
+    w3.provider.make_request("evm_mine", [])
+    send_tx(escrow.functions.activateRoot(token_addr, root_id), "admin")
 
-    released = admin_balance_after - admin_balance_before
-    assert released == payout, f"释放金额不匹配: {released} != {payout}"
-    print(f"  ✅ 紧急释放成功: {released / 10**18} Token 已转出")
+    bal_before = token.functions.balanceOf(accounts["user1"].address).call()
+    proof = []  # 单叶树不需要 proof
+    send_tx(escrow.functions.claim(
+        token_addr, root_id, payout, proof, accounts["user1"].address
+    ), "user1")
+    bal_after = token.functions.balanceOf(accounts["user1"].address).call()
 
-    # 验证 settledButUnallocated 减少
-    new_unallocated = escrow.functions.settledButUnallocated(token_addr).call()
-    assert new_unallocated == unallocated - payout
-    print(f"  ✅ settledButUnallocated 正确减少: {new_unallocated / 10**18} Token")
+    released = bal_after - bal_before
+    assert released == payout, f"清退金额不匹配: {released} != {payout}"
+    print(f"  ✅ 下架 token 存量清退成功: user1 领取 {released / 10**18} Token")
 
     # 恢复白名单（给后续测试用）
     send_tx(escrow.functions.setTokenWhitelist(token_addr, True), "admin")
-    print("  ✅ SOL-10 验证通过: 紧急释放路径工作正常\n")
+    print("  ✅ SOL-10 验证通过: 下架 token 存量清退路径工作正常\n")
 
 
 # ==========================================
@@ -517,7 +512,7 @@ def main():
     print("  SOL-05 ✅ delayWindow < MIN_DELAY_WINDOW 被 revert")
     print("  SOL-07 ✅ transfer/transferFrom to address(0) 被 revert")
     print("  SOL-08 ✅ 角色轮换传错旧地址被 revert")
-    print("  SOL-10 ✅ 代币下架后 emergencyReleaseDelistedFunds 正常释放")
+    print("  SOL-10 ✅ 代币下架后 createTask 被拒、存量走 root 路径清退")
     print()
 
 

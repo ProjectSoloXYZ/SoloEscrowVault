@@ -68,11 +68,13 @@ SimpleToken 是测试/MVP 用途的简化 ERC20，**不作为生产代币合约�
 
 **状态**：已修改，代码已提交
 
-**修改内容**：  
+> ⚠️ 下方为初版「单用户封顶」写法，**已被整改章节取代**：单用户封顶挡不住多用户合谋超发。最终改为聚合守恒 `totalClaimed[token] + delta <= totalAllocated`，错误消息为 `"Exceeds allocated"`（见整改更新章节）。
+
+**修改内容（初版，已被聚合守恒取代）**：  
 在 `claim()` 函数中新增链上校验：
 
 ```solidity
-// SOL-04 修复：用户累计领取不得超过当前 root 的 totalAllocated
+// 初版（已废弃）：单用户封顶
 require(cumulativeAmount <= a.totalAllocated, "Exceeds total allocated");
 ```
 
@@ -85,11 +87,13 @@ require(cumulativeAmount <= a.totalAllocated, "Exceeds total allocated");
 
 **状态**：已修改，代码已提交
 
-**修改内容**：
+> ⚠️ 下方常量数值以初版为准，**已被整改章节细化**：最终为不可调底线 `MIN_REVIEW_FLOOR=1h` + 上限 `MAX_DELAY_WINDOW=30d` + 管理员可配置 `minReviewWindow`（默认 24h），并新增 `initializeV3()` 初始化。以整改更新章节为准。
+
+**修改内容（初版，常量已被整改章节细化）**：
 
 1. 新增常量强制最小审查窗口：
 ```solidity
-uint64 public constant MIN_DELAY_WINDOW = 3600; // 1 hour minimum
+uint64 public constant MIN_DELAY_WINDOW = 3600; // 初版：1 小时下限（最终已改为 24h 默认 + 可配置）
 ```
 
 2. 在 `publishPendingRoot()` 中增加校验：
@@ -113,9 +117,12 @@ uint64 activateAfter = uint64(activateAfterCalc);
 
 ## SOL-06：彩票结果未链上验证（Minor）
 
-**状态**：Acknowledged — 当前不修改，gas 成本不可接受
+> ⚠️ **本小节为 2026-06-27 初版回复，已被文末《整改更新（2026-06-30）》取代。**
+> 最终方案不再是「不修改」，而是做了合约整改：熵改由合约从 `blockhash(taskEntropyBlock)+seedReveal` 派生、中奖人数由合约确定性算出 `min(qualifiedCount, lotteryWinnerCount)`、并提供链下 Guardian 复算脚本（`scripts/guardian_recompute.py`）在审查窗口内挑战。以下初版内容仅作追溯。
 
-**回复**：  
+**状态**：~~Acknowledged — 当前不修改~~ → **Resolved（见整改更新章节）**
+
+**回复（初版，已废弃）**：  
 当前设计中彩票胜者选定采用半中心化方案，**不在链上强制验证**。理由：
 
 **为什么不改**：
@@ -192,10 +199,13 @@ require(hasRole(GUARDIAN_ROLE, oldGuardian), "oldGuardian lacks role");
 
 ## SOL-10：代币下架后已结算资金无法取回（Minor）
 
-**状态**：已修改，代码已提交
+> ⚠️ **本小节为 2026-06-27 初版回复，已被文末《整改更新（2026-06-30）》取代。**
+> 下方 `emergencyReleaseDelistedFunds()`（admin 直接提款）方案**已废弃并从合约中移除**。最终改为放宽 `publishPendingRoot` 白名单条件（`tokenWhitelist[token] || settledButUnallocated[token] > 0`），让下架 token 的存量走正常 root 清退路径，不引入 admin 直接提款。以下初版内容仅作追溯。
 
-**修改内容**：  
-新增紧急释放函数 `emergencyReleaseDelistedFunds()`：
+**状态**：已修改，代码已提交（**注：初版函数已废弃，见整改更新章节**）
+
+**修改内容（初版方案，已废弃）**：  
+~~新增紧急释放函数 `emergencyReleaseDelistedFunds()`~~：
 
 ```solidity
 function emergencyReleaseDelistedFunds(address token, address recipient, uint256 amount)
@@ -227,22 +237,23 @@ function emergencyReleaseDelistedFunds(address token, address recipient, uint256
 | SOL-01 | Centralization | 部署配置 | Acknowledged | 非生产合约；部署时用多签，提供地址即可关闭 |
 | SOL-02 | Centralization | 部署配置 | Acknowledged | 部署 Timelock + 多签，提供地址 + blog 链接关闭 |
 | SOL-03 | Centralization | 部署配置 | Acknowledged | 同 SOL-02，共享关闭条件 |
-| SOL-04 | Medium | **代码修改** | Resolved | claim() 增加 totalAllocated 上限校验 |
-| SOL-05 | Medium | **代码修改** | Resolved | 强制 MIN_DELAY_WINDOW + uint256 防截断 |
-| SOL-06 | Minor | Acknowledged | Acknowledged | gas 不可接受；现有 commit-reveal 可链下验证 |
+| SOL-04 | Medium | **代码修改** | Resolved | claim() 聚合守恒 totalClaimed+delta ≤ totalAllocated |
+| SOL-05 | Medium | **代码修改** | Resolved | MIN_REVIEW_FLOOR/MAX_DELAY_WINDOW/minReviewWindow(默认24h) + uint256 防截断 |
+| SOL-06 | Minor | **代码修改** | Resolved | 熵由合约派生 + 确定性中奖人数 + 链下 Guardian 复算脚本 |
 | SOL-07 | Minor | **代码修改** | Resolved | SimpleToken 增加 to != address(0) 检查 |
 | SOL-08 | Informational | **代码修改** | Resolved | 角色轮换增加 hasRole 前置校验 |
 | SOL-09 | Discussion | Acknowledged | Acknowledged | 确认为预期设计，文档已补充说明 |
-| SOL-10 | Minor | **代码修改** | Resolved | 新增 emergencyReleaseDelistedFunds() |
+| SOL-10 | Minor | **代码修改** | Resolved | publishPendingRoot 放宽白名单走存量清退（未引入 admin 提款） |
 
 ---
 
 ## 关闭条件 Action Items
 
-### 代码修改（5 项，已完成）
-- `contracts/EscrowVault.sol`（SOL-04、SOL-05、SOL-08、SOL-10）
+### 代码修改（6 项 finding，已完成）
+- `contracts/EscrowVault.sol`（SOL-04、SOL-05、SOL-06、SOL-08、SOL-10）
 - `contracts/SimpleToken.sol`（SOL-07）
-- **专项验证脚本**：`tests/test_audit_fixes.py`
+- **链下 Guardian 复算脚本**：`scripts/guardian_recompute.py`（SOL-06，`--self-test` 可离线自测）
+- **专项验证脚本**：`tests/test_audit_fixes.py`、`test/RemediationAudit.t.sol`
 
 ```bash
 # 运行审计修复专项测试（需 Anvil 在后台运行）
@@ -251,9 +262,12 @@ source .venv/bin/activate
 pkill -f anvil 2>/dev/null; anvil &
 sleep 2
 python tests/test_audit_fixes.py
+python scripts/guardian_recompute.py --self-test   # SOL-06 复算脚本自测
 ```
 
-**测试运行结果**（2026-06-27 通过）：
+> ⚠️ **下方为 2026-06-27 初版测试输出**，反映的是初版接口（`Exceeds total allocated`、`emergencyReleaseDelistedFunds` 等）。最终整改后的验收结果以文末《整改更新》章节（`forge test` 42/42 通过）及 `remediation/VERIFICATION_REPORT.md` 为准，`tests/test_audit_fixes.py` 亦已同步至新接口。
+
+**测试运行结果**（2026-06-27 初版，仅作追溯）：
 ```
 ╔══════════════════════════════════════════════════════════╗
 ║   CertiK 审计修复验证测试 (SOL-04/05/07/08/10)        ║
@@ -360,7 +374,7 @@ python scripts/deploy_governance.py
 |---|---|---|---|
 | SOL-04 | Medium | 引入 `totalClaimed[token]`，`claim` 内强制聚合守恒 `totalClaimed[token] + delta ≤ activeRoots[token].totalAllocated`。废弃了本地早期的"单用户封顶"方案（多用户合谋仍可超发） | `contracts/EscrowVault.sol` 的 `claim` |
 | SOL-05 | Medium | 新增 `MIN_REVIEW_FLOOR=1h` / `MAX_DELAY_WINDOW=30d` 常量与可配置 `minReviewWindow`（默认 24h）；`publishPendingRoot` 校验 `[minReviewWindow, MAX_DELAY_WINDOW]`；`activateAfter` 用 uint256 计算后再 bound-check 转 uint64，杜绝截断绕过 | `publishPendingRoot` / `setMinReviewWindow` / `initializeV3` |
-| SOL-06 | Minor | ① `finalizeQualification` 锁定合格名单后记录 `taskEntropyBlock = block.number + 10`；② `settleTask` 移除 Operator 传入的 `entropyValue` 参数，改由合约从 `blockhash(taskEntropyBlock) + seedReveal` 派生最终熵；③ `actualWinnerCount` 由合约确定性算出 `min(qualifiedCount, lotteryWinnerCount)`，不再信 Operator 报送；④ 链下 Guardian 凭 `taskEntropy[taskId]` + 公开算法可独立复算 root 并在审查窗口内挑战 | `finalizeQualification` / `settleTask` |
+| SOL-06 | Minor | ① `finalizeQualification` 锁定合格名单后记录 `taskEntropyBlock = block.number + 10`；② `settleTask` 移除 Operator 传入的 `entropyValue` 参数，改由合约从 `blockhash(taskEntropyBlock) + seedReveal` 派生最终熵；③ `actualWinnerCount` 由合约确定性算出 `min(qualifiedCount, lotteryWinnerCount)`，不再信 Operator 报送；④ 链下 Guardian 凭 `taskEntropy[taskId]` + 公开算法可独立复算 root 并在审查窗口内挑战，复算脚本见 `scripts/guardian_recompute.py`（`--self-test` 离线自测已通过） | `finalizeQualification` / `settleTask` / `scripts/guardian_recompute.py` |
 | SOL-07 | Minor | `SimpleToken.transfer` / `transferFrom` 已加 `to != address(0)` 兜底；文件顶部新增 NatSpec 警示，明确标注为 **测试 mock，生产不使用**，申请 out-of-scope | `contracts/SimpleToken.sol` |
 | SOL-08 | Info | `updateOperator` / `updateGuardian` 增加 `require(hasRole(...))` 校验，旧地址不持角色时 revert，杜绝"撤销空转 + 双持有者"风险 | `EscrowVault.sol` L470/L482 |
 | SOL-09 | Discussion | 累计 root 模型确认保留（小额 gas 刚需）；新增运营约束写入 `docs/security_model.md`：① 旧 proof 在新 root 激活后失效；② 链下 root 生成器必须保留所有"老 root 仍有未领余额"用户的最新累计额，由链下单测卡死 | `docs/security_model.md` |
@@ -377,6 +391,8 @@ python scripts/deploy_governance.py
 - 原回归用例：21 / 21 通过（`test/EscrowVault.t.sol`）。
 - 整改专项验收用例：21 / 21 通过（`test/RemediationAudit.t.sol`），覆盖 SOL-04 多用户合谋拦截、SOL-05 边界、SOL-06 熵分支、SOL-07/08/10 验收点。
 - 合计 42 / 42 通过，`forge build` 无错误。
+- 链下脚本（anvil 实跑）：`tests/test_audit_fixes.py`（SOL-04/05/07/08/10）、`tests/test_escrow_full.py`（多任务累计 root + UUPS 升级端到端）均通过。
+- SOL-06 链下复算脚本 `scripts/guardian_recompute.py --self-test` 自测通过（熵派生、确定性中奖、Merkle proof、篡改检测）。
 
 ### 治理类（SOL-01/02/03）
 

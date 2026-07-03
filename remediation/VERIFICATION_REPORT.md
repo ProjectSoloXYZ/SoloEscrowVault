@@ -14,8 +14,8 @@
 | # | 清单要求 | 完成状态 | 合约改动位置 | 测试用例 |
 |---|---|:---:|---|---|
 | 1 | SOL-04 聚合守恒（非单用户封顶）；多用户超额 root 测试通过 | ✅ | `EscrowVault.sol` `claim()` + `totalClaimed` mapping | `test_SOL04_aggregateSolvency_blocksMultiUserOverClaim` |
-| 2 | SOL-05 最小窗口 + 防截断 + 上限齐全；默认 24h | ✅ | `publishPendingRoot()` + `setMinReviewWindow()` + `initializeV3()` | `test_SOL05_*`（6 个） |
-| 3 | SOL-06 熵由合约派生（非 Operator 传入）；中奖人数确定性；Guardian 可复算 | ✅ | `finalizeQualification()` + `settleTask()` + `taskEntropyBlock` / `taskEntropy` | `test_SOL06_*`（5 个） |
+| 2 | SOL-05 最小窗口 + 防截断 + 上限齐全；默认 24h | ✅ | `publishPendingRoot()` + `setMinReviewWindow()` + `initializeV3()` | `test_SOL05_*`（7 个） |
+| 3 | SOL-06 熵由合约派生（非 Operator 传入）；中奖人数确定性；Guardian 可复算 | ✅ | `finalizeQualification()` + `settleTask()` + `taskEntropyBlock` / `taskEntropy` | `test_SOL06_*`（5 个）+ `scripts/guardian_recompute.py --self-test` |
 | 4 | SOL-10 存量清退走通；`createTask` 对下架 token 仍 revert | ✅ | `publishPendingRoot()` 白名单条件放宽；删除 `emergencyReleaseDelistedFunds` | `test_SOL10_*`（2 个） |
 | 5 | SOL-07/08 按 minor-fixes.md | ✅ | `SimpleToken.sol` 加 NatSpec mock 警示；`updateOperator/updateGuardian` 已有 `hasRole` 校验 | `test_SOL07_*`（2 个）、`test_SOL08_*`（3 个） |
 | 6 | 存储布局：新增变量从 `__gap` 扣除，未破坏升级兼容 | ✅ | `__gap` 从 38 减为 34（新增 4 个顶层变量），不动任何 struct | — |
@@ -40,6 +40,14 @@
 |---|---|
 | `test/EscrowVault.t.sol` | 原有 21 个回归用例（适配新 `settleTask` 签名、`delayWindow` 默认值） |
 | `test/RemediationAudit.t.sol` | **新建**，21 个整改专项验收用例 |
+| `tests/test_audit_fixes.py` | 链下专项验证（SOL-04/05/07/08/10），anvil 实跑通过 |
+| `tests/test_escrow_full.py` | 多任务累计 root + UUPS 升级端到端，anvil 实跑通过 |
+
+### 脚本文件
+
+| 文件 | 内容 |
+|---|---|
+| `scripts/guardian_recompute.py` | **新建**，SOL-06 链下 Guardian 复算脚本（熵派生 / 确定性中奖 / Merkle root 复算 / 篡改检测），`--self-test` 离线自测已通过 |
 
 ### 文档文件
 
@@ -90,6 +98,21 @@ forge test --match-contract EscrowVaultTest -v
 forge test --match-contract RemediationAuditTest -v
 ```
 
+### 链下脚本验证
+
+```bash
+# SOL-06 Guardian 复算脚本离线自测（无需 anvil）
+python scripts/guardian_recompute.py --self-test
+
+# 端到端链下验证（需 anvil 在后台运行）
+pkill -f anvil 2>/dev/null; anvil > /tmp/anvil.log 2>&1 &
+sleep 2
+python tests/test_audit_fixes.py   # SOL-04/05/07/08/10 专项
+python tests/test_escrow_full.py   # 多任务累计 root + UUPS 升级端到端
+```
+
+**预期：** 三个脚本均以 `exitCode 0` 结束，`--self-test` 打印全部检查项通过。
+
 ### 按 Finding 单独验证
 
 ```bash
@@ -101,6 +124,10 @@ forge test --match-test "SOL05" -vv
 
 # SOL-06 熵硬化 + 确定性中奖（5 个用例）
 forge test --match-test "SOL06" -vv
+
+# SOL-06 链下 Guardian 复算脚本离线自测
+#（熵派生确定性 / 中奖人数 min 规则 / 金额守恒 / 全量 Merkle proof / 篡改检测）
+python scripts/guardian_recompute.py --self-test
 
 # SOL-07 SimpleToken 零地址（2 个用例）
 forge test --match-test "SOL07" -vv

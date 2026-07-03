@@ -189,11 +189,8 @@ contract RemediationAuditTest is Test {
     /// @notice 关键：多用户合谋写满 cumulativeAmount → 第二个用户领取必须 revert
     /// 这是 spec §2 明确要求的验收用例
     function test_SOL04_aggregateSolvency_blocksMultiUserOverClaim() public {
-        // 仅一个 task 注入 100 TOKEN（98 TOKEN 进结算池），但 root 里给两个用户各写满 98 TOKEN
-        // 合计 196 > totalAllocated=98，必须有一笔 revert
-        _settleZeroQualified(1 * TOKEN); // 这步不够，需要更大注入
-        // 重新用更标准路径：一个 100 TOKEN 任务，0 资格 → 全退；
-        // 改用 1 个合格用户领 98 TOKEN 的任务
+        // 一个 100 TOKEN 任务、1 个合格用户领 98 TOKEN，结算池注入 98 TOKEN（totalAllocated=98）
+        // 但 root 里给 user1 和 user2 各写满 98 TOKEN，合计 196 > 98，必须有一笔 revert
         bytes32 taskId = _settleOneUserTask(98 * TOKEN);
         uint128 epochDelta = uint128(98 * TOKEN);
 
@@ -384,15 +381,6 @@ contract RemediationAuditTest is Test {
             uint64(block.timestamp + 1 days), uint64(block.timestamp + 2 days),
             keccak256(abi.encodePacked(seed))
         );
-    }
-
-    function _settleZeroQualified(uint256 budget) internal returns (bytes32 taskId) {
-        taskId = _createTask(budget, budget - _fee(budget), 0, 0);
-        vm.warp(block.timestamp + 1 days + 1);
-        vm.prank(operator);
-        vault.finalizeQualification(taskId, 0, bytes32(0), keccak256("qm"));
-        vm.prank(operator);
-        vault.settleTask(taskId, bytes32("seed"), keccak256("r"), 0, uint96(budget - _fee(budget)), 0);
     }
 
     function _settleOneUserTask(uint256 payoutAmount) internal returns (bytes32 taskId) {
