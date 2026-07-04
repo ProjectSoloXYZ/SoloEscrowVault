@@ -118,7 +118,30 @@ Implications for users and off-chain root generation:
 #### Operational SOP for SOL-06
 
 - The seed **MUST** be revealed only after the entropy block has been mined; revealing earlier still works mechanically but defeats the unpredictability.
-- Settlement **MUST** be completed within 256 blocks (~13 minutes on BSC) of the entropy block, otherwise `blockhash` returns zero and `settleTask` reverts with `"entropy block expired"`. The off-chain pipeline must alert operators well before this deadline.
+- Settlement **MUST** be completed within 256 blocks of the entropy block, otherwise `blockhash` returns zero and `settleTask` reverts with `"entropy block expired"`. This is an EVM protocol limit, not a design choice, and the wall-clock duration it represents depends on the deployment chain's block time — **re-measure empirically per chain, do not assume a fixed number of minutes**:
+  - BSC (original audit estimate, ~3s/block): ~13 minutes.
+  - Base Sepolia (measured 2026-07-04 via `eth_getBlockByNumber` timestamp deltas, 2.0s/block): ~8.5 minutes (512s) — about 35% shorter than the BSC estimate.
+  - Re-measure on Base mainnet before launch; do not reuse the testnet figure without verification.
+  - The off-chain pipeline must alert operators well before this deadline, with the alert lead time scaled to whichever window is currently in effect.
+
+#### Known limitation: entropy window exhaustion (e.g. genuine network outage)
+
+If the operator's infrastructure cannot successfully call `settleTask` within the 256-block window (a sustained outage spanning the entire window, not a brief blip), the task becomes **permanently stuck in `QUALIFIED` status**. `taskEntropyBlock[taskId]` is set once in `finalizeQualification` and cannot currently be reset, so every subsequent `settleTask` attempt for that task will revert with `"entropy block expired"` — there is no on-chain retry path today.
+
+This is **accepted as-is for the testnet phase and early mainnet** (decided 2026-07-04), because:
+
+- **No funds are permanently locked.** Once `settlementDeadline` passes, the Sponsor can call `emergencyRefund` and recover the full `totalBudget`. The only loss is the reward that qualified/would-be-winning users never receive — not a fund-safety defect.
+- **The loss is small and cheaply remediable off-chain.** Given per-task and per-user reward sizes (sub-USDC), the platform can identify affected users from the off-chain qualification manifest for that `taskId` and compensate them manually — far cheaper than building, testing, and re-auditing a new privileged on-chain recovery function for a low-probability event.
+- **A naive on-chain fix (operator-triggered reset) reopens a manipulation surface.** An operator can observe a block's hash off-chain in real time regardless of whether `blockhash()` can still read it on-chain; an operator-controlled reset would let them selectively let unfavorable entropy blocks "expire" and re-roll until they like the outcome, while claiming outage. A safer design (e.g. reset gated by `GUARDIAN_ROLE` instead of `OPERATOR_ROLE`, capped attempts, mandatory event emission) was discussed but explicitly deferred — see revisit trigger below.
+
+**Manual remedy playbook**, until an on-chain mechanism is built:
+
+1. Alert on the specific revert reasons `"entropy block not reached"` and `"entropy block expired"` so ops notices promptly rather than discovering it after the fact.
+2. Pull the qualification manifest for the affected `taskId` to identify who would have been eligible for base reward / lottery payout.
+3. Compensate those users manually (direct transfer, or credit toward a future task) as a trust-preserving gesture.
+4. Once `settlementDeadline` passes, have the Sponsor call `emergencyRefund` to reclaim the full `totalBudget` on-chain.
+
+**Revisit trigger**: reconsider building an on-chain reset mechanism if (a) this incident type starts recurring at non-trivial frequency, or (b) Guardian becomes a genuinely independent role from Operator (see centralization disclosure for SOL-01/02/03) — a Guardian-gated reset is only meaningfully safer than an operator-gated one once Guardian and Operator are not effectively the same people.
 
 ### Delisted token wind-down (SOL-10)
 
