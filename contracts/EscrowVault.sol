@@ -221,6 +221,27 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
     //   保证熵来源在锁名单之后、Operator 无法 grind 合格名单
     // - taskEntropy:      settleTask 内派生的最终熵 = keccak256(seedReveal, blockhash(taskEntropyBlock))
     //   任何人凭它 + 公开算法可独立复算中奖名单（链下复算，Guardian 在审查窗口内挑战）
+    //
+    // ⚠️ 换链必读：下面两个"块数"常量在任何 EVM 链上数值不变，
+    //    但对应的墙钟时间取决于出块速度，换链后务必重新核算，别直接套用旧数字：
+    //
+    //      ENTROPY_BLOCK_DELAY = 10 块（锁名单后要等多久才能取熵）
+    //        - BSC（审计原文估算，约 3s/块）  ≈ 30 秒
+    //        - Base Sepolia（2026-07-04 实测，见下方方法，2.0s/块） = 20 秒
+    //
+    //      256 块 = settleTask 必须在 taskEntropyBlock 之后多久内完成
+    //               （EVM 协议级限制：blockhash() 只对最近 256 块非零，超过即
+    //                 revert "entropy block expired"，见 settleTask 内校验）
+    //        - BSC（约 3s/块）        ≈ 768 秒 ≈ 12.8 分钟（文档口径"~13 分钟"）
+    //        - Base Sepolia（2.0s/块，实测） = 512 秒 ≈ 8 分 32 秒 —— 比 BSC 短约 35%，
+    //          链下监控告警阈值要跟着收紧，别沿用按 BSC 估的提前量
+    //
+    //    实测方法（不要凭记忆估算出块时间，链会变、参数会变）：
+    //      对目标链 RPC 调 eth_getBlockByNumber，取最新块与往前 N 块（建议 ≥5000
+    //      做两次不同跨度交叉验证）的 timestamp 差值 / 块数 = 实测出块秒数。
+    //      主网参数与测试网理论一致但存在差异可能，上主网前务必重新实测一次，
+    //      不要直接复用测试网数字。实测后同步更新 docs/security_model.md 里
+    //      SOL-06 SOP 章节的时间说法，以及链下监控的告警提前量。
     uint64 public constant ENTROPY_BLOCK_DELAY = 10;
     mapping(bytes32 => uint64)  public taskEntropyBlock; // 占 1 个 __gap 槽
     mapping(bytes32 => bytes32) public taskEntropy;      // 占 1 个 __gap 槽
@@ -783,7 +804,9 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         if (q.qualifiedCount > 0 && t.lotteryWinnerCount > 0) {
             require(eb != 0 && block.number > eb, "entropy block not reached");
             bytes32 bh = blockhash(eb);
-            require(bh != bytes32(0), "entropy block expired"); // 超过 256 块取不到
+            // 超过 256 块取不到（EVM 协议限制）。这 256 块在不同链上对应的墙钟时间不同，
+            // 换链后的具体秒数、实测方法见上方 ENTROPY_BLOCK_DELAY 常量声明处的注释。
+            require(bh != bytes32(0), "entropy block expired");
             finalEntropy = keccak256(abi.encode(seedReveal, bh));
         }
 
