@@ -226,7 +226,10 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
     mapping(bytes32 => bytes32) public taskEntropy;      // 占 1 个 __gap 槽
 
     // 给未来升级预留存储槽，避免存储冲突
-    uint256[34] private __gap;
+    // 记账修正：审计基线 39 槽 - 本次整改新增 4 个真实状态变量
+    // （minReviewWindow / totalClaimed / taskEntropyBlock / taskEntropy）= 35，
+    // 此前误将 5f61dee 中的 constant（不占存储）当作占用槽多扣了 1 格，此处纠正回 35。
+    uint256[35] private __gap;
 
     // =========================
     //         事件
