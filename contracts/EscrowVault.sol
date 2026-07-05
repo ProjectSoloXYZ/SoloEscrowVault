@@ -45,6 +45,20 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
     // 默认平台费率，200 = 2%
     uint16 public constant DEFAULT_PLATFORM_FEE_BPS = 200;
 
+    // M-1 修复：qualifyDeadline → settlementDeadline 之间的最小间隔。
+    // 背景：finalizeQualification 成功后才会设置未来取熵区块（taskEntropyBlock =
+    // block.number + ENTROPY_BLOCK_DELAY），有抽奖的任务必须等这个区块产生、且在
+    // settlementDeadline 之前才能 settleTask。如果 Sponsor 把 settlementDeadline
+    // 设成等于（或只比）qualifyDeadline 晚一点，任务会进入 QUALIFIED 后天然无法
+    // settleTask（取熵还没到就已经 "Settlement expired"），用户拿不到奖励，Sponsor
+    // 到期只能 emergencyRefund 全额退款——这是一个可被粗心或恶意 Sponsor 触发的
+    // 公平性问题（M-1），不是资金安全问题（钱不会丢，只是发不出奖）。
+    // 对所有任务统一生效（不只抽奖任务）：非抽奖任务在 deadline 相等时技术上能在
+    // 同一区块结算，但窗口只有一个块（Base 上约 2 秒），运营上等于不可用，同样该堵。
+    // 用 constant 而非可配置状态变量：MVP 阶段不需要 admin 可调节的旋钮，且避免
+    // 新增状态变量又要动 __gap（参考此前 __gap 记账修正的教训）。
+    uint64 public constant MIN_SETTLEMENT_WINDOW = 1 hours;
+
     /**
      * @dev 任务状态机
      * NONE       : 不存在
@@ -655,6 +669,15 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
         // 结算截止必须不早于资格截止
         require(settlementDeadline >= qualifyDeadline, "Bad settlementDeadline");
 
+        // M-1 修复：qualifyDeadline 到 settlementDeadline 之间必须留出最小窗口，
+        // 覆盖 finalizeQualification 之后的取熵等待 + 链下结算处理时间，否则任务
+        // 可能进入 QUALIFIED 后天然无法 settleTask（见 MIN_SETTLEMENT_WINDOW 声明处注释）。
+        // 用 uint256 计算，避免 uint64 加法在极端输入下溢出回绕（沿用 SOL-05 的做法）。
+        require(
+            uint256(settlementDeadline) >= uint256(qualifyDeadline) + uint256(MIN_SETTLEMENT_WINDOW),
+            "Settlement window too short"
+        );
+
         // 保底分配 + 抽奖分配 + 平台费不能超过总预算。
         // 平台费从 totalBudget 中计提，因此创建时必须确保最大承诺奖励仍可支付。
         uint256 reserved = uint256(basePool) + uint256(lotteryRewardPerWinner) * uint256(lotteryWinnerCount);
@@ -743,6 +766,17 @@ contract EscrowVault is Initializable, AccessControlUpgradeable, PausableUpgrade
 
         // 如果有人合格，则 root 不能为空；0 人合格时允许空 root
         require(qualifiedCount == 0 || qualifiedRoot != bytes32(0), "Empty qualifiedRoot");
+
+        // M-1 修复（第二层兜底）：createTask 时已保证 qualifyDeadline 到 settlementDeadline
+        // 之间有 MIN_SETTLEMENT_WINDOW，但如果 Operator 拖到很晚才调用本函数（哪怕在
+        // qualifyDeadline 之后很久），这段缓冲可能已经被吃掉。这里再检查一次「现在」到
+        // settlementDeadline 是否还有足够窗口——如果不够，宁可 revert 让任务留在 FUNDED
+        // （之后 Sponsor 可 emergencyRefund），也不要让它进入一个注定无法 settleTask 的
+        // QUALIFIED 状态。用 uint256 计算防溢出，同 createTask 的做法。
+        require(
+            uint256(block.timestamp) + uint256(MIN_SETTLEMENT_WINDOW) <= uint256(t.settlementDeadline),
+            "insufficient settlement window"
+        );
 
         qualifications[taskId] = Qualification({
             qualifiedCount: qualifiedCount,
