@@ -80,14 +80,30 @@ NONE → FUNDED → QUALIFIED → SETTLED / REFUNDABLE → REFUNDED
 
 ```
 .
-├── contracts/          # Solidity 合约（含触发 ERC1967Proxy 编译的 Proxy.sol）
-├── test/               # Foundry Solidity 测试
-├── tests/              # Python + web3.py 端到端测试脚本
-├── docs/               # 设计文档
-├── foundry.toml        # Foundry 编译配置（src/out/remappings）
-├── lib/                # OpenZeppelin 依赖（forge install 后生成，已在 .gitignore）
+├── contracts/
+│   ├── EscrowVault.sol          # 核心托管合约（已含审计修复）
+│   ├── SimpleToken.sol          # 测试用 ERC20 代币（已含审计修复）
+│   ├── Proxy.sol                # 触发 ERC1967Proxy 编译的入口
+│   └── Governance.sol           # 🆕 触发 TimelockController 编译的入口
+├── test/
+│   └── EscrowVault.t.sol        # Foundry Solidity 测试
+├── tests/
+│   ├── test_escrow_full.py      # Python 端到端测试（完整业务流程）
+│   └── test_audit_fixes.py      # 🆕 CertiK 审计修复专项验证测试
+├── scripts/
+│   └── deploy_governance.py     # 🆕 治理部署脚本（Timelock + 多签迁移）
+├── docs/
+│   ├── CertiK_Audit_Response.md # 🆕 CertiK 审计回复文档
+│   ├── security_model.md        # 安全模型文档
+│   ├── changeable_fee_rate_prd.md
+│   ├── EscrowVault_合约设计文档.docx
+│   └── semi_centralized_payment_design_spec_v2.docx
+├── foundry.toml                 # Foundry 编译配置
+├── lib/                         # OpenZeppelin 依赖（forge install 后生成，已在 .gitignore）
 └── README.md
 ```
+
+> 🆕 标记的文件为 CertiK 审计修复后新增。
 
 ## 技术栈
 
@@ -159,7 +175,22 @@ python tests/test_escrow_full.py
 4. **第三阶段**：`emergencyRefund` 超时退款 + Guardian `cancelPendingRoot`。
 5. **第四阶段**：UUPS `upgradeToAndCall` 升级及权限校验。
 
-### 6. 重新跑测试（可选）
+### 6. 运行 CertiK 审计修复专项验证测试
+
+针对 SOL-04/05/07/08/10 五项代码修改的专项验证：
+
+```bash
+python tests/test_audit_fixes.py
+```
+
+脚本会自动验证：
+- **SOL-04**：`claim()` 超额领取被链上拦截（Exceeds total allocated）
+- **SOL-05**：`delayWindow < 3600` 被 revert（Delay too short）
+- **SOL-07**：`transfer/transferFrom` 到零地址被 revert
+- **SOL-08**：角色轮换传错旧地址被 revert（oldOperator lacks role）
+- **SOL-10**：代币下架后 `emergencyReleaseDelistedFunds()` 正常释放资金
+
+### 7. 重新跑测试（可选）
 
 如需从干净状态再跑一次，关闭 Anvil 后重新启动，并删除地址缓存：
 

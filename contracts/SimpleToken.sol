@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.0;
 
+/// @title SimpleToken (TEST MOCK ONLY — NOT FOR PRODUCTION)
+/// @notice 仅用于本地/测试环境模拟 ERC20。生产部署一律使用 USDT/USDC 等审计过的稳定币。
+/// @dev 故意保留最简实现：无 burn、无访问控制、不实现 ERC20 完整语义。
+///      已在 CertiK 整改回应中申请标记为 out-of-scope（见 docs/CertiK_Audit_Response.md）。
+///      SOL-07 修复：transfer/transferFrom 已加入 to != address(0) 兜底检查。
 contract SimpleToken {
     string public name;
     string public symbol;
@@ -21,6 +26,7 @@ contract SimpleToken {
     }
     
     function transfer(address to, uint256 value) public virtual returns (bool) {
+        require(to != address(0), "Transfer to zero address");
         require(balanceOf[msg.sender] >= value, "Insufficient balance");
         balanceOf[msg.sender] -= value;
         balanceOf[to] += value;
@@ -35,6 +41,7 @@ contract SimpleToken {
     }
     
     function transferFrom(address from, address to, uint256 value) public virtual returns (bool) {
+        require(to != address(0), "Transfer to zero address");
         require(balanceOf[from] >= value, "Insufficient balance");
         require(allowance[from][msg.sender] >= value, "Insufficient allowance");
         balanceOf[from] -= value;

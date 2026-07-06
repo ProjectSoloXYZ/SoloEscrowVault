@@ -219,9 +219,12 @@ def deploy_contracts():
     impl_addr = receipt_impl.contractAddress
     print(f"[OK] Implementation 地址: {impl_addr}")
 
-    # 2. 编码 initialize calldata
+    # 2. 编码 initialize calldata（web3 7.x 用 _encode_transaction_data）
     op_addr = accounts['operator'].address
-    init_data = Escrow.encode_abi("initialize", args=[op_addr, op_addr, op_addr])
+    impl_contract = w3.eth.contract(address=impl_addr, abi=ESCROW_ABI)
+    init_data = bytes.fromhex(
+        impl_contract.functions.initialize(op_addr, op_addr, op_addr)._encode_transaction_data()[2:]
+    )
     
     # 3. 部署 Proxy
     Proxy = w3.eth.contract(abi=PROXY_ABI, bytecode=PROXY_BYTECODE)
@@ -346,16 +349,14 @@ def run_phase1_test(token_addr: str, escrow_addr: str):
         # ▶ 调用 settleTask(): 0人合格，正常结算仍按任务总预算计提平台费
         payout = 0
         refund = budget - platform_fee
+        # SOL-06 硬化后签名：6 参数，Operator 不再传入熵/中奖人数
         send_tx(escrow.functions.settleTask(
-            task_id, 
+            task_id,
             server_secret,      # seedReveal —— 揭示之前承诺的随机种子
-            0,                  # entropyRef —— 外部随机数引用
-            bytes(32),          # entropyValue —— 外部随机数值
             fake_manifest,      # resultManifestHash —— 结果清单哈希
-            payout,             # payoutAmount —— 实际支付金额
+            payout,             # payoutAmount —— 实际支付金额（0 人合格 → 0）
             refund,             # refundableAmount —— 可退款金额
-            0,                  # baseRewardPerQualified —— 每人基础奖励
-            0                   # actualWinnerCount —— 实际中奖人数
+            0                   # baseRewardPerQualified —— 每人基础奖励（0 人合格 → 0）
         ), 'operator')
         print(f"   [OK] 任务结算完成！支付: {payout}，退款: {refund}，平台费: {platform_fee}")
         final_task = escrow.functions.tasks(task_id).call()
@@ -415,49 +416,42 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
     ), 'sponsor')
     print(f"   [OK] 任务 A 创建成功! Task ID: {task_id_a.hex()}")
 
-    # 任务 A 哈希抽奖
+    # 任务 A：2 人合格、抽奖名额 2 → 合约按 min(qualified, winnerCount)=2 确定性全员中奖（SOL-06）
     qualified_users = [user1_addr, user2_addr]
     qualified_count = len(qualified_users)
-    base_reward_per_a = base_pool_a // qualified_count
-    seed_a = w3.keccak(server_secret_a + bytes(32))
-    
-    print(f"   [抽奖 A] 开奖 Seed: {seed_a.hex()[:15]}...")
-    scores_a = []
-    for i, user_addr in enumerate(qualified_users):
-        q_leaf = w3.keccak(task_id_a + bytes.fromhex(user_addr[2:]))
-        score_int = int.from_bytes(w3.keccak(seed_a + q_leaf), 'big')
-        scores_a.append((score_int, user_addr))
-        print(f"   [抽奖 A] {'User1' if user_addr == user1_addr else 'User2'} 得分: {score_int}")
-        
-    scores_a.sort(key=lambda x: x[0])
-    winners_a = [x[1] for x in scores_a[:1]]
-    print(f"   [抽奖 A] 最终中奖者是: {'User1' if winners_a[0] == user1_addr else 'User2'} ! (得分最小)")
+    base_reward_per_a = base_pool_a // qualified_count       # 每人基础奖励
+    expected_winners_a = min(qualified_count, 2)             # 合约确定性中奖人数 = 2
 
-    # 任务 A 分配金额
-    user1_reward_a = base_reward_per_a + (lottery_r_a if user1_addr in winners_a else 0)
-    user2_reward_a = base_reward_per_a + (lottery_r_a if user2_addr in winners_a else 0)
-    payout_amount_a = user1_reward_a + user2_reward_a
+    # 分配金额：合格者都拿基础奖励，中奖者额外拿一份 lottery
+    user1_reward_a = base_reward_per_a + lottery_r_a
+    user2_reward_a = base_reward_per_a + lottery_r_a
+    payout_amount_a = base_reward_per_a * qualified_count + lottery_r_a * expected_winners_a
     platform_fee_a = platform_fee_for_budget(escrow, task_budget_a)
     refund_amount_a = task_budget_a - payout_amount_a - platform_fee_a
 
-    # 快进并冻结
+    # 快进过资格截止并冻结名单
     w3.provider.make_request('evm_increaseTime', [3601])
     w3.provider.make_request('evm_mine', [])
-    
+
     # 构建真实的 合格名单 Merkle Root
     qualified_leaves_a = [w3.keccak(task_id_a + bytes.fromhex(u[2:])) for u in qualified_users]
     qualified_tree_a = MerkleTree(qualified_leaves_a)
     real_qualified_root_a = qualified_tree_a.root
-    
+
     send_tx(escrow.functions.finalizeQualification(task_id_a, 2, real_qualified_root_a, bytes("manifest", "utf-8").rjust(32, b'\0')), 'operator')
-    
-    print("   [步骤 A] Operator 结算任务...")
+
+    # SOL-06：结算前必须越过取熵区块（finalize 后第 ENTROPY_BLOCK_DELAY=10 块），熵由合约派生
+    for _ in range(11):
+        w3.provider.make_request('evm_mine', [])
+
+    print("   [步骤 A] Operator 结算任务（熵由合约派生、中奖人数确定性）...")
     send_tx(escrow.functions.settleTask(
-        task_id_a, server_secret_a, 0, bytes(32), bytes("result", "utf-8").rjust(32, b'\0'),
-        payout_amount_a, refund_amount_a, base_reward_per_a, 1
+        task_id_a, server_secret_a, bytes("result", "utf-8").rjust(32, b'\0'),
+        payout_amount_a, refund_amount_a, base_reward_per_a
     ), 'operator')
     print(f"   [OK]任务 A 已结算! 发放: {payout_amount_a / (10**18)}, 退款: {refund_amount_a / (10**18)}, 平台费: {platform_fee_a / (10**18)}")
-    send_tx(escrow.functions.claimRefund(task_id_a, sponsor_addr), 'sponsor')
+    if refund_amount_a > 0:
+        send_tx(escrow.functions.claimRefund(task_id_a, sponsor_addr), 'sponsor')
     # ================= 任务 A 结束 =================
 
 
@@ -480,26 +474,14 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
     ), 'sponsor')
     print(f"   [OK] 任务 B 创建成功! Task ID: {task_id_b.hex()}")
 
-    # 任务 B 哈希抽奖
+    # 任务 B：同样 2 人合格、抽奖名额 2 → 确定性全员中奖（SOL-06）
     base_reward_per_b = base_pool_b // qualified_count
-    seed_b = w3.keccak(server_secret_b + bytes(32))
-    
-    print(f"   [抽奖 B] 开奖 Seed: {seed_b.hex()[:15]}...")
-    scores_b = []
-    for i, user_addr in enumerate(qualified_users):
-        q_leaf = w3.keccak(task_id_b + bytes.fromhex(user_addr[2:]))
-        score_int = int.from_bytes(w3.keccak(seed_b + q_leaf), 'big')
-        scores_b.append((score_int, user_addr))
-        print(f"   [抽奖 B] {'User1' if user_addr == user1_addr else 'User2'} 得分: {score_int}")
-        
-    scores_b.sort(key=lambda x: x[0])
-    winners_b = [x[1] for x in scores_b[:1]]
-    print(f"   [抽奖 B] 最终中奖者是: {'User1' if winners_b[0] == user1_addr else 'User2'} ! (得分最小)")
+    expected_winners_b = min(qualified_count, 2)             # = 2
 
     # 任务 B 分配金额
-    user1_reward_b = base_reward_per_b + (lottery_r_b if user1_addr in winners_b else 0)
-    user2_reward_b = base_reward_per_b + (lottery_r_b if user2_addr in winners_b else 0)
-    payout_amount_b = user1_reward_b + user2_reward_b
+    user1_reward_b = base_reward_per_b + lottery_r_b
+    user2_reward_b = base_reward_per_b + lottery_r_b
+    payout_amount_b = base_reward_per_b * qualified_count + lottery_r_b * expected_winners_b
     platform_fee_b = platform_fee_for_budget(escrow, task_budget_b)
     refund_amount_b = task_budget_b - payout_amount_b - platform_fee_b
 
@@ -513,14 +495,19 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
     real_qualified_root_b = qualified_tree_b.root
 
     send_tx(escrow.functions.finalizeQualification(task_id_b, 2, real_qualified_root_b, bytes("manifest", "utf-8").rjust(32, b'\0')), 'operator')
-    
-    print("   [步骤 B] Operator 结算任务...")
+
+    # SOL-06：结算前越过取熵区块
+    for _ in range(11):
+        w3.provider.make_request('evm_mine', [])
+
+    print("   [步骤 B] Operator 结算任务（熵由合约派生、中奖人数确定性）...")
     send_tx(escrow.functions.settleTask(
-        task_id_b, server_secret_b, 0, bytes(32), bytes("result", "utf-8").rjust(32, b'\0'),
-        payout_amount_b, refund_amount_b, base_reward_per_b, 1
+        task_id_b, server_secret_b, bytes("result", "utf-8").rjust(32, b'\0'),
+        payout_amount_b, refund_amount_b, base_reward_per_b
     ), 'operator')
     print(f"   [OK]任务 B 已结算! 发放: {payout_amount_b / (10**18)}, 退款: {refund_amount_b / (10**18)}, 平台费: {platform_fee_b / (10**18)}")
-    send_tx(escrow.functions.claimRefund(task_id_b, sponsor_addr), 'sponsor')
+    if refund_amount_b > 0:
+        send_tx(escrow.functions.claimRefund(task_id_b, sponsor_addr), 'sponsor')
     # ================= 任务 B 结束 =================
 
 
@@ -557,7 +544,7 @@ def run_phase2_test(token_addr: str, escrow_addr: str):
 
 
     print("\n[步骤 5] Operator 生成并发布 汇总 Merkle Root...")
-    delay_window = 5
+    delay_window = 86400  # SOL-05 修复后默认最小审查窗口为 24 小时
     fake_root_manifest = bytes("root_manifest", "utf-8").rjust(32, b'\0')
     
     # 发布累积金额需要配合 epochDeltaAmount
@@ -708,8 +695,8 @@ def run_phase3_test(token_addr: str, escrow_addr: str):
     # payout=1 wei，refund 扣除平台费后返还 Sponsor，确保 settledButUnallocated > 0
     platform_fee = platform_fee_for_budget(escrow, budget)
     send_tx(escrow.functions.settleTask(
-        task_id2, server_secret, 0, bytes(32), fake_manifest,
-        1, budget - platform_fee - 1, 1, 0
+        task_id2, server_secret, fake_manifest,
+        1, budget - platform_fee - 1, 1
     ), 'operator')
     print(f"   [OK] 第二个任务结算完成，Operator 获得可用池度，平台费: {platform_fee / (10**18)} Token")
 
@@ -721,7 +708,7 @@ def run_phase3_test(token_addr: str, escrow_addr: str):
 
     # epochDeltaAmount 只能用已结算但未分配的 1 wei
     send_tx(escrow.functions.publishPendingRoot(
-        token_addr, root_id, malicious_root, 1, 3600, fake_manifest
+        token_addr, root_id, malicious_root, 1, 86400, fake_manifest
     ), 'operator')
     print(f"   [OK] Operator 发布了待激活 Root (ID: {root_id})")
 
@@ -847,8 +834,8 @@ def run_phase4_upgrade_test(token_addr: str, escrow_addr: str):
     receipt = send_tx(escrow.functions.finalizeQualification(task_id2, 0, bytes(32), fake_manifest), 'operator')
     assert receipt.status == 1, "升级后 finalizeQualification 失败"
     receipt = send_tx(escrow.functions.settleTask(
-        task_id2, server_secret2, 0, bytes(32), fake_manifest,
-        0, budget - platform_fee_for_budget(escrow, budget), 0, 0
+        task_id2, server_secret2, fake_manifest,
+        0, budget - platform_fee_for_budget(escrow, budget), 0
     ), 'operator')
     assert receipt.status == 1, "升级后 settleTask 失败"
     print("   [OK] 升级后任务结算流程正常")
