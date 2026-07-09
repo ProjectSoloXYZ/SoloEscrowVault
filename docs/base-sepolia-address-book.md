@@ -39,8 +39,6 @@
 | Timelock canceller | `0xdd5CEfdE7A44a1A242e887dd697455fD81fbF182` | Admin Safe |
 | Platform treasury | `0xdd5CEfdE7A44a1A242e887dd697455fD81fbF182` | 交接文档链上快照显示当前为 Admin Safe | 
 
-备注：`deployments/path_b_base_sepolia.json` 中的 `platform_treasury` 记录为 `0x89946bb9D13b8BDF24C9047C7c655AC4acA58c49`，交接文档链上快照记录当前 `platformTreasury` 为 Admin Safe。优先以最新链上读取结果和交接 Runbook 为准；如移交前再次核验，建议用 `platformTreasury()` 直接读链确认。
-
 ## 4. Safe Owner Addresses
 
 
