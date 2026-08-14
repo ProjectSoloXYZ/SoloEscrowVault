@@ -1,0 +1,40 @@
+{
+  "deployed_at": 1783565257,
+  "chain_id": 84532,
+  "network": "Base Sepolia",
+  "source_commit": "b6b2346c52021e9eafe6ca3c6dddf1d78963e306",
+  "proxy_deploy_tx_hash": "0x520b8aea4d612ea0d6a0537c094fe5067054adf04514a5b9aa5d19f89d3aa4ee",
+  "deployer": "0x73311B9e68D0e7B80D48444A8b7BFF1F1Fd88776",
+  "admin_safe": "0xdd5CEfdE7A44a1A242e887dd697455fD81fbF182",
+  "guardian_safe": "0x9DbB8F6cD251D508015D93D14E08a4CEAac84C40",
+  "operator": "0x73311B9e68D0e7B80D48444A8b7BFF1F1Fd88776",
+  "timelock_delay_seconds": 600,
+  "timelock_controller": "0x89946bb9D13b8BDF24C9047C7c655AC4acA58c49",
+  "escrow_vault_implementation": "0xace943dB8abDCdf79B27c2715067CCfB4E59b8d0",
+  "escrow_vault_proxy": "0x86493b48CBEbd7B25BD89de585FFbEC439A4e453",
+  "platform_treasury": "0x89946bb9D13b8BDF24C9047C7c655AC4acA58c49",
+  "roles": {
+    "DEFAULT_ADMIN_ROLE": "0x0000000000000000000000000000000000000000000000000000000000000000",
+    "OPERATOR_ROLE": "0x97667070c54ef182b0f5858b034beac1b6f3089aa2d3188bb1e8929f4fa9b929",
+    "GUARDIAN_ROLE": "0x55435dd261a4b9b3364963f7738a7a662ad9c84396d64be3365284bb7f0a5041",
+    "PROPOSER_ROLE": "0xb09aa5aeb3702cfd50b6b62bc4532604938f21248a27a1d5ca736082b6819cc1",
+    "EXECUTOR_ROLE": "0xd8aa0f3194971a2a116679f7c2090f6939c8d4e01a2a8d7e41d55e5351469e63",
+    "CANCELLER_ROLE": "0xfd643c72710c63c0180259aba6b2d05451e3591a24e58b62239378085726f783"
+  },
+  "checks": {
+    "Vault admin is Timelock": true,
+    "Vault operator is OPERATOR_ADDRESS": true,
+    "Vault guardian is Guardian Safe": true,
+    "Deployer is not Vault admin": true,
+    "Admin Safe is Timelock proposer": true,
+    "Admin Safe is Timelock executor": true,
+    "Admin Safe is Timelock canceller": true,
+    "Deployer is not Timelock admin": true,
+    "Timelock is self-admin": true
+  },
+  "next_steps": [
+    "Use Admin Safe to schedule Timelock calls for setTokenWhitelist(token, true).",
+    "Use Admin Safe to schedule Timelock call for setPlatformTreasury(treasury).",
+    "Use a small proposal to verify schedule -> wait -> execute end to end."
+  ]
+}

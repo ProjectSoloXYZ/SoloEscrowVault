@@ -11,6 +11,7 @@ __pycache__/
 
 # Deploy artifacts
 deployed_contracts.json
+governance_deployment.json
 broadcast/
 
 # IDE
