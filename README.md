@@ -129,6 +129,9 @@ pip install web3
 ### 2. 安装 Solidity 依赖
 
 ```bash
+# Foundry 测试库
+forge install foundry-rs/forge-std --no-git
+
 # 拉取 OpenZeppelin 合约库到 lib/
 forge install OpenZeppelin/openzeppelin-contracts --no-git
 forge install OpenZeppelin/openzeppelin-contracts-upgradeable --no-git

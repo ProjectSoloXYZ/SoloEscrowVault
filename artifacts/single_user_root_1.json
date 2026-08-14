@@ -1,0 +1,16 @@
+{
+  "account": "0x73311B9e68D0e7B80D48444A8b7BFF1F1Fd88776",
+  "token": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+  "root_id": 1,
+  "cumulative_amount": 1000000,
+  "leaf": "0xf43c43f2b6699b51e968f3580773e7efd6597fc44ad1cae72c377afbbaca6d1f",
+  "merkle_root": "0xf43c43f2b6699b51e968f3580773e7efd6597fc44ad1cae72c377afbbaca6d1f",
+  "proof": [],
+  "claim_args": {
+    "token": "0x036CbD53842c5426634e7929541eC2318f3dCF7e",
+    "rootId": 1,
+    "cumulativeAmount": 1000000,
+    "merkleProof": [],
+    "recipient": "0x73311B9e68D0e7B80D48444A8b7BFF1F1Fd88776"
+  }
+}
