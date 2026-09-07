@@ -20,3 +20,4 @@ broadcast/
 # OS
 .DS_Store
 Thumbs.db
+foundry.lock
